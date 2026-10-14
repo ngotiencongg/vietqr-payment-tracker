@@ -36,7 +36,9 @@ import {
   ShieldCheck,
   Smartphone,
   BellRing,
-  FileCheck2
+  FileCheck2,
+  Cloud,
+  Link2,
 } from 'lucide-react';
 
 // Danh sách ngân hàng phổ biến hỗ trợ VietQR (BIN & ShortName)
@@ -72,10 +74,12 @@ const DEFAULT_TEAMMATES = ['anh Tài', 'anh Hà', 'anh Thành', 'Linh'];
 const LEGACY_DEFAULT_TEAMMATES = new Set(['nam', 'hùng', 'trang', 'minh', 'hương', 'tuấn', 'lan']);
 
 const DEFAULT_HOST_SETTINGS = {
-  bankBin: '970436',
+  bankBin: '970422',
   accountNumber: '',
   accountName: '',
   geminiApiKey: '',
+  firebaseUrl: '',
+  customRoomName: '',
 };
 
 const STORAGE_KEYS = {
@@ -83,6 +87,7 @@ const STORAGE_KEYS = {
   PARTICIPANTS: 'vietqr_lunch_tracker_participants_v1',
   TEAMMATES: 'vietqr_lunch_tracker_teammates_v2',
   VIEW_MODE: 'vietqr_lunch_tracker_view_mode_v1',
+  CLOUD_ROOM_ID: 'vietqr_lunch_tracker_cloud_room_id_v1',
 };
 
 // Sử dụng model gemini-3.8-flash hiện hành thay cho gemini-1.5-flash đã ngừng hỗ trợ
@@ -501,19 +506,89 @@ export function buildVietQrUrl({ bankBin, accountNumber, accountName, amount, pa
   return `${baseUrl}?${queryParams.toString().replace(/\+/g, '%20')}`;
 }
 
+/**
+ * Đồng bộ dữ liệu phòng lên Cloud (Hỗ trợ Firebase Realtime DB hoặc REST Cloud công cộng miễn phí)
+ */
+export async function syncRoomToCloud({ roomId, host, items, firebaseUrl, customRoomName }) {
+  if (firebaseUrl && firebaseUrl.trim()) {
+    const cleanUrl = firebaseUrl.trim().replace(/\/+$/, '');
+    const roomKey = (customRoomName || roomId || 'room').trim();
+    const endpoint = `${cleanUrl}/rooms/${encodeURIComponent(roomKey)}.json`;
+    const res = await fetch(endpoint, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host, items, updatedAt: Date.now() }),
+    });
+    if (!res.ok) throw new Error('Không thể đồng bộ tới Firebase');
+    return roomKey;
+  }
+
+  const payload = {
+    name: 'vietqr_room',
+    data: { host, items, updatedAt: Date.now() },
+  };
+
+  if (roomId && !roomId.startsWith('demo-')) {
+    try {
+      const res = await fetch(`https://api.restful-api.dev/objects/${roomId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) return roomId;
+    } catch {
+      // nếu không cập nhật được thì tạo mới bên dưới
+    }
+  }
+
+  const res = await fetch('https://api.restful-api.dev/objects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error('Không thể tạo phòng trên Cloud');
+  const data = await res.json();
+  return data.id;
+}
+
+/**
+ * Đọc dữ liệu phòng từ Cloud
+ */
+export async function fetchRoomFromCloud({ roomId, firebaseUrl }) {
+  if (!roomId) return null;
+
+  if (firebaseUrl && firebaseUrl.trim()) {
+    const cleanUrl = firebaseUrl.trim().replace(/\/+$/, '');
+    const endpoint = `${cleanUrl}/rooms/${encodeURIComponent(roomId)}.json`;
+    const res = await fetch(endpoint);
+    if (!res.ok) throw new Error('Không tìm thấy phòng trên Firebase');
+    const data = await res.json();
+    return data;
+  }
+
+  const res = await fetch(`https://api.restful-api.dev/objects/${encodeURIComponent(roomId)}`);
+  if (!res.ok) throw new Error('Không tìm thấy phòng');
+  const obj = await res.json();
+  return obj?.data || null;
+}
+
 export default function App() {
-  // Kiểm tra nếu URL có chứa dữ liệu chia sẻ cho người trả tiền (?share=...&person=...)
+  // Kiểm tra nếu URL có chứa dữ liệu chia sẻ hoặc mã phòng Cloud (?pay=... hoặc ?room=... hoặc ?share=...)
   const sharedUrlParams = useMemo(() => {
     if (typeof window === 'undefined') {
-      return { isSharedLink: false, payload: null, personFilter: '' };
+      return { isSharedLink: false, isCloudRoom: false, roomId: '', payload: null, personFilter: '' };
     }
     const params = new URLSearchParams(window.location.search);
     const shareToken = params.get('share');
+    const roomParam = (params.get('pay') || params.get('room') || params.get('id') || '').trim();
     const personParam = params.get('person') || '';
     const modeParam = params.get('role');
     const decoded = decodeSharePayload(shareToken);
+
     return {
-      isSharedLink: Boolean(decoded) || modeParam === 'payer',
+      isSharedLink: Boolean(decoded) || Boolean(roomParam) || modeParam === 'payer',
+      isCloudRoom: Boolean(roomParam),
+      roomId: roomParam,
       payload: decoded,
       personFilter: personParam,
     };
@@ -659,6 +734,105 @@ export default function App() {
       return 'grouped';
     }
   });
+
+  // Quản lý Phòng Cloud để tạo Link Khách siêu ngắn
+  const [cloudRoomId, setCloudRoomId] = useState(() => {
+    if (sharedUrlParams.roomId) return sharedUrlParams.roomId;
+    try {
+      return localStorage.getItem(STORAGE_KEYS.CLOUD_ROOM_ID) || '';
+    } catch {
+      return '';
+    }
+  });
+
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'synced' | 'error'
+
+  // Khi Người trả tiền mở Link Khách (?pay=... hoặc ?room=...), tự động tải dữ liệu từ Cloud
+  useEffect(() => {
+    if (!sharedUrlParams.isCloudRoom || !sharedUrlParams.roomId) return;
+
+    let isMounted = true;
+    const loadCloudRoomData = async () => {
+      try {
+        const cloudData = await fetchRoomFromCloud({
+          roomId: sharedUrlParams.roomId,
+          firebaseUrl: hostSettings.firebaseUrl,
+        });
+        if (!isMounted || !cloudData) return;
+
+        if (cloudData.host && typeof cloudData.host === 'object') {
+          setHostSettings((prev) => ({
+            ...prev,
+            ...cloudData.host,
+            geminiApiKey: '',
+          }));
+        }
+
+        if (Array.isArray(cloudData.items)) {
+          setParticipants(cloudData.items);
+        }
+      } catch (err) {
+        console.error('Không thể tải phòng từ Cloud:', err);
+      }
+    };
+
+    loadCloudRoomData();
+
+    // Định kỳ tải cập nhật mới nhất từ chủ trì (mỗi 7 giây)
+    const interval = setInterval(loadCloudRoomData, 7000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [sharedUrlParams.isCloudRoom, sharedUrlParams.roomId, hostSettings.firebaseUrl]);
+
+  // Nếu là Chủ trì và đã có phòng Cloud, định kỳ lắng nghe xác nhận chuyển tiền từ khách (mỗi 9 giây)
+  useEffect(() => {
+    if (appRole !== 'host' || !cloudRoomId || sharedUrlParams.isCloudRoom) return;
+
+    let isMounted = true;
+    const pollPayerUpdates = async () => {
+      try {
+        const cloudData = await fetchRoomFromCloud({
+          roomId: hostSettings.customRoomName || cloudRoomId,
+          firebaseUrl: hostSettings.firebaseUrl,
+        });
+        if (!isMounted || !cloudData || !Array.isArray(cloudData.items)) return;
+
+        setParticipants((localPrev) => {
+          let hasChange = false;
+          const updated = localPrev.map((localItem) => {
+            const remoteItem = cloudData.items.find(
+              (ri) =>
+                ri.id === localItem.id ||
+                (ri.name === localItem.name &&
+                  Number(ri.amount) === Number(localItem.amount) &&
+                  (ri.note || '') === (localItem.note || ''))
+            );
+            if (remoteItem && remoteItem.paid !== localItem.paid) {
+              hasChange = true;
+              return { ...localItem, paid: remoteItem.paid };
+            }
+            return localItem;
+          });
+          if (hasChange) {
+            showToast('Đã nhận xác nhận chuyển khoản mới từ người trả tiền!');
+            return updated;
+          }
+          return localPrev;
+        });
+      } catch {
+        // bỏ qua lỗi gián đoạn mạng
+      }
+    };
+
+    const interval = setInterval(pollPayerUpdates, 9000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [appRole, cloudRoomId, hostSettings.customRoomName, hostSettings.firebaseUrl, sharedUrlParams.isCloudRoom]);
 
   // Đồng bộ thời gian thực giữa 2 tab trên cùng trình duyệt (Storage Event)
   useEffect(() => {
@@ -922,7 +1096,7 @@ export default function App() {
     return participants;
   }, [participants, filterStatus]);
 
-  // Tạo đường dẫn chia sẻ sạch sẽ (rút gọn dữ liệu nén, tách riêng người nếu có)
+  // Tạo đường dẫn chia sẻ dự phòng (nếu ngoại tuyến)
   const buildShareUrl = (specificPersonName = '') => {
     let itemsToShare = participants;
     if (specificPersonName) {
@@ -947,24 +1121,97 @@ export default function App() {
     return url.toString();
   };
 
-  // Tạo và sao chép Link dành riêng cho Người trả tiền (không lộ API Key, không có nút cài đặt)
-  const handleCopyShareLink = async (specificPersonName = '') => {
-    const urlStr = buildShareUrl(specificPersonName);
+  // Tạo & sao chép Link Khách siêu ngắn dạng ?pay=room_id
+  const handleCopyCustomerLink = async (specificPersonName = '') => {
+    setIsSyncingCloud(true);
+    setCloudSyncStatus('syncing');
     try {
-      await navigator.clipboard.writeText(urlStr);
+      const targetRoomKey = hostSettings.customRoomName || cloudRoomId;
+
+      const newRoomId = await syncRoomToCloud({
+        roomId: targetRoomKey,
+        host: {
+          bankBin: hostSettings.bankBin,
+          accountNumber: hostSettings.accountNumber,
+          accountName: hostSettings.accountName,
+        },
+        items: participants,
+        firebaseUrl: hostSettings.firebaseUrl,
+        customRoomName: hostSettings.customRoomName,
+      });
+
+      if (newRoomId && newRoomId !== cloudRoomId) {
+        setCloudRoomId(newRoomId);
+        try {
+          localStorage.setItem(STORAGE_KEYS.CLOUD_ROOM_ID, newRoomId);
+        } catch {
+          // ignore
+        }
+      }
+
+      const activeId = newRoomId || cloudRoomId;
+      const url = new URL(window.location.origin + window.location.pathname);
+      url.searchParams.set('pay', activeId);
+      if (specificPersonName) {
+        url.searchParams.set('person', specificPersonName);
+      }
+
+      await navigator.clipboard.writeText(url.toString());
+      setCloudSyncStatus('synced');
       showToast(
         specificPersonName
           ? `Đã chép Link thanh toán riêng cho ${specificPersonName}!`
-          : 'Đã chép Link rút gọn để gửi nhóm Zalo!'
+          : 'Đã sao chép Link Khách siêu ngắn để gửi vào Zalo!'
       );
-    } catch {
-      showToast('Không thể sao chép link tự động.');
+    } catch (err) {
+      console.error('Lỗi đồng bộ Cloud:', err);
+      setCloudSyncStatus('error');
+      const fallbackUrl = buildShareUrl(specificPersonName);
+      await navigator.clipboard.writeText(fallbackUrl).catch(() => {});
+      showToast('Đã chép link thanh toán (chế độ dự phòng)!');
+    } finally {
+      setIsSyncingCloud(false);
     }
   };
 
-  // Sao chép tin nhắn tổng hợp định dạng sẵn kèm link mở QR để gửi Zalo
+  // Sao chép tin nhắn tổng hợp định dạng sẵn kèm Link Khách siêu ngắn để gửi Zalo
   const handleCopyZaloSummaryMessage = async () => {
-    const urlStr = buildShareUrl();
+    setIsSyncingCloud(true);
+    let payUrl = '';
+    try {
+      const targetRoomKey = hostSettings.customRoomName || cloudRoomId;
+      const newRoomId = await syncRoomToCloud({
+        roomId: targetRoomKey,
+        host: {
+          bankBin: hostSettings.bankBin,
+          accountNumber: hostSettings.accountNumber,
+          accountName: hostSettings.accountName,
+        },
+        items: participants,
+        firebaseUrl: hostSettings.firebaseUrl,
+        customRoomName: hostSettings.customRoomName,
+      });
+
+      if (newRoomId && newRoomId !== cloudRoomId) {
+        setCloudRoomId(newRoomId);
+        try {
+          localStorage.setItem(STORAGE_KEYS.CLOUD_ROOM_ID, newRoomId);
+        } catch {
+          // ignore
+        }
+      }
+
+      const activeId = newRoomId || cloudRoomId;
+      const url = new URL(window.location.origin + window.location.pathname);
+      url.searchParams.set('pay', activeId);
+      payUrl = url.toString();
+      setCloudSyncStatus('synced');
+    } catch {
+      payUrl = buildShareUrl();
+    } finally {
+      setIsSyncingCloud(false);
+    }
+
     const unpaidList = aggregatedPeople.filter((p) => !p.allPaid);
     const listToReport = unpaidList.length > 0 ? unpaidList : aggregatedPeople;
 
@@ -982,12 +1229,12 @@ export default function App() {
         return `${idx + 1}. ${p.displayName}: ${formatVND(p.qrAmount)} [${itemDetails}]`;
       }),
       '',
-      `👉 Quét mã VietQR chuyển khoản nhanh tại: ${urlStr}`,
+      `👉 Quét mã VietQR chuyển khoản nhanh tại: ${payUrl}`,
     ];
 
     try {
       await navigator.clipboard.writeText(messageLines.join('\n'));
-      showToast('Đã chép tin nhắn Zalo kèm bảng kê & link mở QR!');
+      showToast('Đã chép tin nhắn Zalo kèm Link Khách siêu ngắn!');
     } catch {
       showToast('Không thể sao chép tự động.');
     }
@@ -1412,31 +1659,63 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
     }
   };
 
+  // Đẩy cập nhật tức thì lên Cloud khi có thay đổi trạng thái thanh toán hoặc danh sách
+  const pushParticipantsToCloud = (nextItems) => {
+    const targetRoom =
+      sharedUrlParams.roomId ||
+      (appRole === 'host' ? hostSettings.customRoomName || cloudRoomId : '');
+    if (!targetRoom) return;
+
+    syncRoomToCloud({
+      roomId: targetRoom,
+      host: {
+        bankBin: hostSettings.bankBin,
+        accountNumber: hostSettings.accountNumber,
+        accountName: hostSettings.accountName,
+      },
+      items: nextItems,
+      firebaseUrl: hostSettings.firebaseUrl,
+      customRoomName: hostSettings.customRoomName,
+    }).catch((err) => console.warn('Lỗi đồng bộ Cloud:', err));
+  };
+
   // Thao tác trạng thái theo từng khoản lẻ (item)
   const toggleItemPaidStatus = (id) => {
-    setParticipants((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, paid: !p.paid } : p))
-    );
+    setParticipants((prev) => {
+      const next = prev.map((p) => (p.id === id ? { ...p, paid: !p.paid } : p));
+      pushParticipantsToCloud(next);
+      return next;
+    });
   };
 
   // Thao tác trạng thái theo từng người (tất cả các khoản của người đó)
   const togglePersonPaidStatus = (personKey, targetPaidState) => {
-    setParticipants((prev) =>
-      prev.map((p) =>
+    setParticipants((prev) => {
+      const next = prev.map((p) =>
         normalizePersonKey(p.name) === personKey ? { ...p, paid: targetPaidState } : p
-      )
-    );
+      );
+      pushParticipantsToCloud(next);
+      return next;
+    });
   };
 
   const removeParticipantItem = (id) => {
-    setParticipants((prev) => prev.filter((p) => p.id !== id));
+    setParticipants((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      pushParticipantsToCloud(next);
+      return next;
+    });
     if (qrTarget?.mode === 'item' && qrTarget.id === id) {
       closeQrModal();
     }
   };
 
   const removePersonGroup = (personKey) => {
-    setParticipants((prev) => prev.filter((p) => normalizePersonKey(p.name) !== personKey));
+    setParticipants((prev) => {
+      const next = prev.filter((p) => normalizePersonKey(p.name) !== personKey);
+      pushParticipantsToCloud(next);
+      return next;
+    });
     if (qrTarget?.mode === 'person' && qrTarget.personKey === personKey) {
       closeQrModal();
     }
@@ -1445,11 +1724,16 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
   const clearAllParticipants = () => {
     if (participants.length === 0) return;
     setParticipants([]);
+    pushParticipantsToCloud([]);
     showToast('Đã xoá toàn bộ danh sách!');
   };
 
   const markAllPaid = () => {
-    setParticipants((prev) => prev.map((p) => ({ ...p, paid: true })));
+    setParticipants((prev) => {
+      const next = prev.map((p) => ({ ...p, paid: true }));
+      pushParticipantsToCloud(next);
+      return next;
+    });
     showToast('Đã đánh dấu tất cả là Đã trả!');
   };
 
@@ -1602,22 +1886,28 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => handleCopyShareLink()}
-                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 px-3 py-1.5 rounded-xl border border-indigo-400/30 transition"
-                title="Sao chép đường dẫn rút gọn chỉ hiển thị giao diện Người trả tiền để gửi vào nhóm Zalo"
+                onClick={() => handleCopyCustomerLink()}
+                disabled={isSyncingCloud}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-xl shadow-xs transition disabled:opacity-60"
+                title="Tạo và sao chép đường dẫn giao diện Khách siêu ngắn để gửi vào nhóm Zalo"
               >
-                <Share2 className="w-3.5 h-3.5" />
-                <span>Copy Link gửi nhóm</span>
+                {isSyncingCloud ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Link2 className="w-3.5 h-3.5" />
+                )}
+                <span>Copy Link Khách (Ngắn)</span>
               </button>
 
               <button
                 type="button"
                 onClick={handleCopyZaloSummaryMessage}
-                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 px-3 py-1.5 rounded-xl border border-emerald-400/30 transition"
-                title="Sao chép tin nhắn tổng hợp danh sách từng người kèm link để dán ngay vào Zalo"
+                disabled={isSyncingCloud}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 px-3 py-1.5 rounded-xl border border-indigo-400/30 transition disabled:opacity-60"
+                title="Sao chép tin nhắn tổng hợp danh sách từng người kèm Link Khách để dán ngay vào Zalo"
               >
                 <MessageSquareText className="w-3.5 h-3.5" />
-                <span>Copy tin nhắn Zalo kèm Link</span>
+                <span>Copy tin nhắn Zalo</span>
               </button>
             </div>
           </div>
@@ -2083,6 +2373,64 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                             <Eye className="w-4 h-4" />
                           )}
                         </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Cấu hình Đồng bộ Cloud & Tên phòng riêng (Tạo Link Khách siêu ngắn) */}
+                  <div className="pt-3 border-t border-slate-200/80 space-y-2.5">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+                      <div>
+                        <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <Cloud className="w-4 h-4 text-indigo-600" />
+                          <span>Đồng bộ Đám mây & Link Khách siêu ngắn</span>
+                        </h3>
+                        <p className="text-[11px] text-slate-500">
+                          Tự động lưu phòng lên Cloud để tạo Link Khách ngắn đẹp và cập nhật trạng thái thanh toán thời gian thực.
+                        </p>
+                      </div>
+                      {cloudRoomId && (
+                        <span className="self-start sm:self-auto text-[11px] font-mono font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          ID Phòng: {cloudRoomId.slice(0, 16)}...
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                      <div>
+                        <label className="block text-slate-700 font-semibold mb-1">
+                          Tên phòng hiển thị (Tuỳ chọn - dùng với Firebase)
+                        </label>
+                        <input
+                          type="text"
+                          value={hostSettings.customRoomName || ''}
+                          onChange={(e) =>
+                            setHostSettings((prev) => ({
+                              ...prev,
+                              customRoomName: e.target.value.trim().replace(/\s+/g, '-'),
+                            }))
+                          }
+                          placeholder="VD: cong hoặc trua-nay"
+                          className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-slate-800 outline-none focus:border-indigo-500 text-xs"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-slate-700 font-semibold mb-1">
+                          Firebase Realtime Database URL (Tuỳ chọn)
+                        </label>
+                        <input
+                          type="text"
+                          value={hostSettings.firebaseUrl || ''}
+                          onChange={(e) =>
+                            setHostSettings((prev) => ({
+                              ...prev,
+                              firebaseUrl: e.target.value.trim(),
+                            }))
+                          }
+                          placeholder="https://...-default-rtdb.firebaseio.com (để trống để dùng Cloud miễn phí sẵn có)"
+                          className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-slate-800 outline-none focus:border-indigo-500 text-xs"
+                        />
                       </div>
                     </div>
                   </div>
@@ -2851,7 +3199,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
 
                             <button
                               type="button"
-                              onClick={() => handleCopyShareLink(person.displayName)}
+                              onClick={() => handleCopyCustomerLink(person.displayName)}
                               className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition"
                               title={`Sao chép Link thanh toán riêng gửi cho ${person.displayName}`}
                             >
