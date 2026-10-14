@@ -189,10 +189,34 @@ export function parseMoneyValue(rawNumber, rawUnit = '') {
     return rawNumber > 0 && rawNumber < 1000 ? Math.round(rawNumber * 1000) : Math.round(rawNumber);
   }
 
-  const numStr = String(rawNumber || '').trim();
+  let numStr = String(rawNumber || '').trim();
   if (!numStr) return 0;
 
-  const unit = String(rawUnit || '').toLowerCase().trim();
+  let unit = String(rawUnit || '').toLowerCase().trim();
+
+  // Nhận diện đơn vị đính kèm trong chuỗi nếu có (VD: "75k", "75.5k", "75 cành")
+  if (!unit) {
+    const inlineUnitMatch = numStr.match(/(k|ngàn|ngan|nghìn|nghin|cành|canh|lít|lit|đồng|dong|vnđ|vnd|đ|d)$/i);
+    if (inlineUnitMatch) {
+      unit = inlineUnitMatch[1].toLowerCase();
+      numStr = numStr.slice(0, -inlineUnitMatch[0].length).trim();
+    }
+  }
+
+  // Hỗ trợ số tiền viết dạng "75k815" hoặc "75k5"
+  const kMidMatch = numStr.match(/^(\d+)\s*(?:k|ngàn|nghìn|cành)\s*(\d{1,3})$/i);
+  if (kMidMatch) {
+    const intPart = parseInt(kMidMatch[1], 10);
+    const fracStr = kMidMatch[2];
+    if (fracStr.length === 3) {
+      return intPart * 1000 + parseInt(fracStr, 10);
+    } else if (fracStr.length === 2) {
+      return intPart * 1000 + parseInt(fracStr, 10) * 10;
+    } else {
+      return intPart * 1000 + parseInt(fracStr, 10) * 100;
+    }
+  }
+
   const isThousandUnit = ['k', 'ngàn', 'ngan', 'nghìn', 'nghin', 'cành', 'canh'].includes(unit);
   const isHundredThousandUnit = ['lít', 'lit'].includes(unit);
 
@@ -212,6 +236,8 @@ export function parseMoneyValue(rawNumber, rawUnit = '') {
   const parsedInt = parseInt(digitsOnly, 10);
   if (isNaN(parsedInt) || parsedInt <= 0) return 0;
 
+  // Nếu người dùng nhập số tắt quá nhỏ (< 1000, VD: 75 -> 75.000đ)
+  // Nếu nhập số từ 1000 trở lên (VD: 75815, 12500, 75.815), giữ nguyên chính xác từng đồng lẻ!
   return parsedInt < 1000 ? parsedInt * 1000 : parsedInt;
 }
 
@@ -2150,12 +2176,11 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           Số tiền cần thu (VNĐ)
                         </label>
                         <input
-                          type="number"
-                          min="0"
-                          step="1000"
+                          type="text"
+                          inputMode="numeric"
                           value={manualAmount}
                           onChange={(e) => setManualAmount(e.target.value)}
-                          placeholder="VD: 45000"
+                          placeholder="VD: 75815 hoặc 45.000 hoặc 50k..."
                           className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
                         />
 
