@@ -130,6 +130,28 @@ export function normalizePersonKey(name) {
  */
 export function encodeSharePayload(payload) {
   try {
+    if (payload?.host && Array.isArray(payload?.items)) {
+      const compact = {
+        v: 2,
+        b: payload.host.bankBin || '',
+        a: payload.host.accountNumber || '',
+        n: payload.host.accountName || '',
+        i: payload.items.map((it) => [
+          it.name,
+          it.amount,
+          it.note || '',
+          it.paid ? 1 : 0,
+        ]),
+      };
+      const json = JSON.stringify(compact);
+      const bytes = new TextEncoder().encode(json);
+      let binary = '';
+      bytes.forEach((b) => {
+        binary += String.fromCharCode(b);
+      });
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
     const json = JSON.stringify(payload);
     const bytes = new TextEncoder().encode(json);
     let binary = '';
@@ -149,7 +171,28 @@ export function decodeSharePayload(encoded) {
     const binary = atob(base64);
     const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
     const json = new TextDecoder().decode(bytes);
-    return JSON.parse(json);
+    const parsed = JSON.parse(json);
+
+    // Chuẩn v2 nén siêu gọn
+    if (parsed && (parsed.v === 2 || parsed.b !== undefined)) {
+      return {
+        host: {
+          bankBin: parsed.b || '',
+          accountNumber: parsed.a || '',
+          accountName: parsed.n || '',
+        },
+        items: (parsed.i || []).map((it, idx) => ({
+          id: `share-${idx}-${Date.now().toString(36)}`,
+          name: it[0],
+          amount: it[1],
+          note: it[2] || '',
+          paid: Boolean(it[3]),
+        })),
+      };
+    }
+
+    // Tương thích ngược với định dạng v1 cũ
+    return parsed;
   } catch {
     return null;
   }
@@ -879,34 +922,74 @@ export default function App() {
     return participants;
   }, [participants, filterStatus]);
 
-  // Tạo và sao chép Link dành riêng cho Người trả tiền (không lộ API Key, không có nút cài đặt)
-  const handleCopyShareLink = async (specificPersonName = '') => {
+  // Tạo đường dẫn chia sẻ sạch sẽ (rút gọn dữ liệu nén, tách riêng người nếu có)
+  const buildShareUrl = (specificPersonName = '') => {
+    let itemsToShare = participants;
+    if (specificPersonName) {
+      const targetKey = normalizePersonKey(specificPersonName);
+      itemsToShare = participants.filter((p) => normalizePersonKey(p.name) === targetKey);
+    }
+
     const shareData = {
       host: {
         bankBin: hostSettings.bankBin,
         accountNumber: hostSettings.accountNumber,
         accountName: hostSettings.accountName,
       },
-      items: participants,
+      items: itemsToShare,
     };
     const token = encodeSharePayload(shareData);
-    const url = new URL(window.location.href);
+    const url = new URL(window.location.origin + window.location.pathname);
     url.searchParams.set('share', token);
     if (specificPersonName) {
       url.searchParams.set('person', specificPersonName);
-    } else {
-      url.searchParams.delete('person');
     }
+    return url.toString();
+  };
 
+  // Tạo và sao chép Link dành riêng cho Người trả tiền (không lộ API Key, không có nút cài đặt)
+  const handleCopyShareLink = async (specificPersonName = '') => {
+    const urlStr = buildShareUrl(specificPersonName);
     try {
-      await navigator.clipboard.writeText(url.toString());
+      await navigator.clipboard.writeText(urlStr);
       showToast(
         specificPersonName
           ? `Đã chép Link thanh toán riêng cho ${specificPersonName}!`
-          : 'Đã chép Link trang Người trả tiền để gửi nhóm Zalo!'
+          : 'Đã chép Link rút gọn để gửi nhóm Zalo!'
       );
     } catch {
       showToast('Không thể sao chép link tự động.');
+    }
+  };
+
+  // Sao chép tin nhắn tổng hợp định dạng sẵn kèm link mở QR để gửi Zalo
+  const handleCopyZaloSummaryMessage = async () => {
+    const urlStr = buildShareUrl();
+    const unpaidList = aggregatedPeople.filter((p) => !p.allPaid);
+    const listToReport = unpaidList.length > 0 ? unpaidList : aggregatedPeople;
+
+    if (listToReport.length === 0) {
+      showToast('Chưa có khoản thu nào để tạo tin nhắn!');
+      return;
+    }
+
+    const messageLines = [
+      '📢 MỌI NGƯỜI CHUYỂN KHOẢN TIỀN ĂN UỐNG GIÚP MÌNH NHÉ:',
+      ...listToReport.map((p, idx) => {
+        const itemDetails = p.items
+          .map((i) => (i.note ? `${i.note} (${formatVND(i.amount)})` : formatVND(i.amount)))
+          .join(' + ');
+        return `${idx + 1}. ${p.displayName}: ${formatVND(p.qrAmount)} [${itemDetails}]`;
+      }),
+      '',
+      `👉 Quét mã VietQR chuyển khoản nhanh tại: ${urlStr}`,
+    ];
+
+    try {
+      await navigator.clipboard.writeText(messageLines.join('\n'));
+      showToast('Đã chép tin nhắn Zalo kèm bảng kê & link mở QR!');
+    } catch {
+      showToast('Không thể sao chép tự động.');
     }
   };
 
@@ -1516,15 +1599,27 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => handleCopyShareLink()}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 px-3 py-1.5 rounded-xl border border-indigo-400/30 transition"
-              title="Sao chép đường dẫn chỉ hiển thị giao diện Người trả tiền để gửi vào nhóm Zalo"
-            >
-              <Share2 className="w-3.5 h-3.5" />
-              <span>Copy Link gửi nhóm Zalo</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleCopyShareLink()}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 px-3 py-1.5 rounded-xl border border-indigo-400/30 transition"
+                title="Sao chép đường dẫn rút gọn chỉ hiển thị giao diện Người trả tiền để gửi vào nhóm Zalo"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                <span>Copy Link gửi nhóm</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopyZaloSummaryMessage}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 px-3 py-1.5 rounded-xl border border-emerald-400/30 transition"
+                title="Sao chép tin nhắn tổng hợp danh sách từng người kèm link để dán ngay vào Zalo"
+              >
+                <MessageSquareText className="w-3.5 h-3.5" />
+                <span>Copy tin nhắn Zalo kèm Link</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
