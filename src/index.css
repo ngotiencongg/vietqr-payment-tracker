@@ -1,1 +1,21 @@
 @import "tailwindcss";
+
+/* Modern Web Guidance: Prevent underlying page scroll when modal <dialog> is open */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Modern Web Guidance: Balanced headings for better legibility */
+h1, h2, h3, h4 {
+  text-wrap: balance;
+}
+
+/* Tabular numbers for currency alignment */
+.font-money {
+  font-variant-numeric: tabular-nums;
+}

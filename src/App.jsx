@@ -41,6 +41,9 @@ import {
   Link2,
   HardDrive,
   RotateCcw,
+  Pencil,
+  Calculator,
+  Undo2,
 } from 'lucide-react';
 
 // Danh sách ngân hàng phổ biến hỗ trợ VietQR (BIN & ShortName)
@@ -910,12 +913,23 @@ export default function App() {
   // ==========================================
   const [activeTab, setActiveTab] = useState('manual'); // 'manual' | 'paste' | 'ai' | 'reconcile'
 
-  // Tab 1: Nhập tay
+  // Tab 1: Nhập tay & Chia đều nhanh (Quick Split Bill)
   const [manualName, setManualName] = useState('');
   const [manualNote, setManualNote] = useState('');
   const [manualAmount, setManualAmount] = useState('');
   const [newTeammateInput, setNewTeammateInput] = useState('');
   const [showAddTeammate, setShowAddTeammate] = useState(false);
+  const [isSplitMode, setIsSplitMode] = useState(false); // false = Nhập 1 người, true = Chia đều nhiều người
+  const [selectedSplitNames, setSelectedSplitNames] = useState([]);
+  const [splitCalcType, setSplitCalcType] = useState('divide'); // 'divide' (Chia đều từ tổng bill) | 'same' (Mỗi người cùng 1 số tiền)
+
+  // Chỉnh sửa trực tiếp món đã nhập (Inline Edit)
+  const [editingItem, setEditingItem] = useState(null); // { id, name, note, amount }
+
+  // Tìm kiếm & Bộ lọc nhanh trên Dashboard Chủ trì
+  const [hostSearchQuery, setHostSearchQuery] = useState('');
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [hideRecoveryBanner, setHideRecoveryBanner] = useState(false);
 
   // Tab 2: Dán tin nhắn Zalo
   const [chatLogText, setChatLogText] = useState('');
@@ -934,8 +948,10 @@ export default function App() {
   const [verifyMessage, setVerifyMessage] = useState(null); // { type: 'success' | 'error', text: string }
   const receiptVerifyInputRef = useRef(null);
 
-  // Thông báo nhanh (Toast)
+  // Thông báo nhanh (Toast) kèm hỗ trợ Hoàn tác (Undo)
   const [toastMessage, setToastMessage] = useState(null);
+  const [undoSnapshot, setUndoSnapshot] = useState(null); // Array of previous participants
+  const toastTimerRef = useRef(null);
 
   // ==========================================
   // PHASE 3: VIETQR MODAL & DASHBOARD STATES
@@ -975,28 +991,31 @@ export default function App() {
 
     dialog.addEventListener('close', handleNativeClose);
 
-    let handleBackdropClick = null;
+    // Modern Web Guidance (dialog): Light-dismiss fallback for browsers without native closedby="any"
+    let handlePointerDown = null;
+    let handlePointerUp = null;
     if (typeof HTMLDialogElement !== 'undefined' && !('closedBy' in HTMLDialogElement.prototype)) {
-      handleBackdropClick = (event) => {
-        if (event.target !== dialog) return;
-        const rect = dialog.getBoundingClientRect();
-        const isDialogContent =
-          rect.top <= event.clientY &&
-          event.clientY <= rect.top + rect.height &&
-          rect.left <= event.clientX &&
-          event.clientX <= rect.left + rect.width;
-        if (!isDialogContent) {
+      const isOutside = (e) => {
+        const r = dialog.getBoundingClientRect();
+        return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+      };
+      let pressedOutside = false;
+      handlePointerDown = (e) => {
+        pressedOutside = isOutside(e);
+      };
+      handlePointerUp = (e) => {
+        if (pressedOutside && isOutside(e)) {
           dialog.close();
         }
       };
-      dialog.addEventListener('click', handleBackdropClick);
+      dialog.addEventListener('pointerdown', handlePointerDown);
+      dialog.addEventListener('pointerup', handlePointerUp);
     }
 
     return () => {
       dialog.removeEventListener('close', handleNativeClose);
-      if (handleBackdropClick) {
-        dialog.removeEventListener('click', handleBackdropClick);
-      }
+      if (handlePointerDown) dialog.removeEventListener('pointerdown', handlePointerDown);
+      if (handlePointerUp) dialog.removeEventListener('pointerup', handlePointerUp);
     };
   }, []);
 
@@ -1013,11 +1032,24 @@ export default function App() {
     }
   };
 
-  const showToast = (msg) => {
+  const showToast = (msg, previousItemsForUndo = null) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToastMessage(msg);
-    setTimeout(() => {
-      setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 3200);
+    setUndoSnapshot(previousItemsForUndo);
+    toastTimerRef.current = setTimeout(() => {
+      setToastMessage(null);
+      setUndoSnapshot(null);
+    }, previousItemsForUndo ? 5500 : 3200);
+  };
+
+  const handleUndoLastAction = () => {
+    if (!undoSnapshot) return;
+    setParticipants(undoSnapshot);
+    pushParticipantsToCloud(undoSnapshot);
+    setUndoSnapshot(null);
+    setToastMessage('Đã hoàn tác khôi phục dữ liệu vừa xoá!');
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2800);
   };
 
   // =========================================================================
@@ -1093,28 +1125,53 @@ export default function App() {
   }, [participants, aggregatedPeople]);
 
   const filteredPeople = useMemo(() => {
-    if (filterStatus === 'unpaid') return aggregatedPeople.filter((p) => !p.allPaid);
-    if (filterStatus === 'paid') return aggregatedPeople.filter((p) => p.allPaid);
-    return aggregatedPeople;
-  }, [aggregatedPeople, filterStatus]);
+    let list = aggregatedPeople;
+    if (filterStatus === 'unpaid') list = list.filter((p) => !p.allPaid);
+    if (filterStatus === 'paid') list = list.filter((p) => p.allPaid);
+
+    const q = normalizePersonKey(hostSearchQuery);
+    if (q) {
+      const asciiQ = removeVietnameseTones(q).toLowerCase();
+      list = list.filter(
+        (p) =>
+          p.personKey.includes(q) ||
+          removeVietnameseTones(p.displayName).toLowerCase().includes(asciiQ) ||
+          p.items.some((it) => removeVietnameseTones(it.note || '').toLowerCase().includes(asciiQ))
+      );
+    }
+
+    // Ưu tiên hiển thị người chưa trả đủ lên trên, người đã hoàn tất xuống dưới
+    return [...list].sort((a, b) => Number(a.allPaid) - Number(b.allPaid));
+  }, [aggregatedPeople, filterStatus, hostSearchQuery]);
 
   const payerFilteredPeople = useMemo(() => {
     const q = normalizePersonKey(payerSearchQuery);
-    if (!q) return aggregatedPeople;
+    if (!q) return [...aggregatedPeople].sort((a, b) => Number(a.allPaid) - Number(b.allPaid));
+    const asciiQ = removeVietnameseTones(q).toLowerCase();
     return aggregatedPeople.filter(
       (p) =>
         p.personKey.includes(q) ||
-        removeVietnameseTones(p.displayName)
-          .toLowerCase()
-          .includes(removeVietnameseTones(q).toLowerCase())
+        removeVietnameseTones(p.displayName).toLowerCase().includes(asciiQ)
     );
   }, [aggregatedPeople, payerSearchQuery]);
 
   const filteredItems = useMemo(() => {
-    if (filterStatus === 'unpaid') return participants.filter((p) => !p.paid);
-    if (filterStatus === 'paid') return participants.filter((p) => p.paid);
-    return participants;
-  }, [participants, filterStatus]);
+    let list = participants;
+    if (filterStatus === 'unpaid') list = list.filter((p) => !p.paid);
+    if (filterStatus === 'paid') list = list.filter((p) => p.paid);
+
+    const q = normalizePersonKey(hostSearchQuery);
+    if (q) {
+      const asciiQ = removeVietnameseTones(q).toLowerCase();
+      list = list.filter(
+        (p) =>
+          normalizePersonKey(p.name).includes(q) ||
+          removeVietnameseTones(p.name).toLowerCase().includes(asciiQ) ||
+          removeVietnameseTones(p.note || '').toLowerCase().includes(asciiQ)
+      );
+    }
+    return list;
+  }, [participants, filterStatus, hostSearchQuery]);
 
   // Tạo đường dẫn chia sẻ dự phòng (nếu ngoại tuyến)
   const buildShareUrl = (specificPersonName = '') => {
@@ -1255,7 +1312,8 @@ export default function App() {
     const messageLines = [
       '📢 MỌI NGƯỜI CHUYỂN KHOẢN TIỀN ĂN UỐNG GIÚP MÌNH NHÉ:',
       ...listToReport.map((p, idx) => {
-        const itemDetails = p.items
+        const activeItems = p.unpaidAmount > 0 ? p.items.filter((i) => !i.paid) : p.items;
+        const itemDetails = activeItems
           .map((i) => (i.note ? `${i.note} (${formatVND(i.amount)})` : formatVND(i.amount)))
           .join(' + ');
         return `${idx + 1}. ${p.displayName}: ${formatVND(p.qrAmount)} [${itemDetails}]`;
@@ -1424,12 +1482,80 @@ export default function App() {
     showToast('Đã gộp cộng dồn các khoản theo từng người!');
   };
 
-  // Xử lý Tab 1: Nhập tay
+  // Xử lý chọn/bỏ chọn người trong chế độ Chia đều nhanh
+  const toggleSplitPersonSelection = (teammateName) => {
+    setSelectedSplitNames((prev) => {
+      const key = normalizePersonKey(teammateName);
+      const exists = prev.some((n) => normalizePersonKey(n) === key);
+      if (exists) {
+        return prev.filter((n) => normalizePersonKey(n) !== key);
+      }
+      return [...prev, teammateName];
+    });
+  };
+
+  // Xử lý lưu chỉnh sửa trực tiếp món (Inline Edit)
+  const handleSaveEditedItem = (e) => {
+    if (e) e.preventDefault();
+    if (!editingItem) return;
+    const cleanName = editingItem.name.trim();
+    const numericAmount = parseMoneyValue(editingItem.amount);
+    if (!cleanName || !numericAmount || numericAmount <= 0) {
+      showToast('Vui lòng nhập tên và số tiền hợp lệ!');
+      return;
+    }
+    setParticipants((prev) => {
+      const next = prev.map((it) =>
+        it.id === editingItem.id
+          ? {
+              ...it,
+              name: cleanName,
+              note: (editingItem.note || '').trim(),
+              amount: numericAmount,
+            }
+          : it
+      );
+      pushParticipantsToCloud(next);
+      return next;
+    });
+    setEditingItem(null);
+    showToast(`Đã cập nhật khoản của ${cleanName} (${formatVND(numericAmount)})!`);
+  };
+
+  // Xử lý Tab 1: Nhập tay 1 người HOẶC Chia đều cho nhiều người
   const handleManualSubmit = (e) => {
     e.preventDefault();
-    const cleanName = manualName.trim();
     const numericAmount = parseMoneyValue(manualAmount);
 
+    if (isSplitMode) {
+      if (selectedSplitNames.length === 0) {
+        showToast('Vui lòng chọn ít nhất 1 đồng nghiệp để chia tiền!');
+        return;
+      }
+      if (!numericAmount || numericAmount <= 0) {
+        showToast('Vui lòng nhập số tiền hợp lệ!');
+        return;
+      }
+      const perPersonAmount =
+        splitCalcType === 'divide'
+          ? Math.round(numericAmount / selectedSplitNames.length)
+          : numericAmount;
+
+      const itemsToAdd = selectedSplitNames.map((personName) => ({
+        name: personName,
+        note: manualNote.trim(),
+        amount: perPersonAmount,
+      }));
+      addParticipants(itemsToAdd);
+      setManualNote('');
+      setManualAmount('');
+      showToast(
+        `Đã thêm cho ${selectedSplitNames.length} người (${formatVND(perPersonAmount)}/người)!`
+      );
+      return;
+    }
+
+    const cleanName = manualName.trim();
     if (!cleanName || !numericAmount || numericAmount <= 0) {
       showToast('Vui lòng nhập tên và số tiền hợp lệ!');
       return;
@@ -1797,32 +1923,47 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
   };
 
   const removeParticipantItem = (id) => {
-    setParticipants((prev) => {
-      const next = prev.filter((p) => p.id !== id);
-      pushParticipantsToCloud(next);
-      return next;
-    });
+    const targetItem = participants.find((p) => p.id === id);
+    const snapshot = [...participants];
+    const next = participants.filter((p) => p.id !== id);
+    setParticipants(next);
+    pushParticipantsToCloud(next);
     if (qrTarget?.mode === 'item' && qrTarget.id === id) {
       closeQrModal();
     }
+    showToast(
+      `Đã xoá ${targetItem ? `${targetItem.name} (${formatVND(targetItem.amount)})` : '1 khoản'}`,
+      snapshot
+    );
   };
 
   const removePersonGroup = (personKey) => {
-    setParticipants((prev) => {
-      const next = prev.filter((p) => normalizePersonKey(p.name) !== personKey);
-      pushParticipantsToCloud(next);
-      return next;
-    });
+    const group = aggregatedPeople.find((p) => p.personKey === personKey);
+    const snapshot = [...participants];
+    const next = participants.filter((p) => normalizePersonKey(p.name) !== personKey);
+    setParticipants(next);
+    pushParticipantsToCloud(next);
     if (qrTarget?.mode === 'person' && qrTarget.personKey === personKey) {
       closeQrModal();
     }
+    showToast(
+      `Đã xoá tất cả khoản của ${group ? group.displayName : 'người này'}`,
+      snapshot
+    );
   };
 
   const clearAllParticipants = () => {
     if (participants.length === 0) return;
+    if (!confirmClearAll) {
+      setConfirmClearAll(true);
+      setTimeout(() => setConfirmClearAll(false), 3800);
+      return;
+    }
+    const snapshot = [...participants];
+    setConfirmClearAll(false);
     setParticipants([]);
     pushParticipantsToCloud([]);
-    showToast('Đã xoá toàn bộ danh sách!');
+    showToast('Đã xoá toàn bộ danh sách!', snapshot);
   };
 
   const markAllPaid = () => {
@@ -1938,11 +2079,21 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
         className="hidden"
       />
 
-      {/* Toast Notification */}
+      {/* Toast Notification with Undo Support */}
       {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-xl border border-slate-700 animate-bounce">
+        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-3 bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-xl border border-slate-700 animate-in fade-in slide-in-from-bottom-3">
           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
           <span className="text-sm font-medium">{toastMessage}</span>
+          {undoSnapshot && (
+            <button
+              type="button"
+              onClick={handleUndoLastAction}
+              className="inline-flex items-center gap-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs px-2.5 py-1 rounded-lg transition shrink-0"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+              <span>Hoàn tác</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -2114,11 +2265,13 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                         onClick={() =>
                           setPayerSearchQuery(isSelected ? '' : person.displayName)
                         }
-                        className={`text-xs font-semibold px-2.5 py-1 rounded-full border transition ${
+                        className={`text-xs font-semibold px-2.5 py-1 rounded-full border transition font-money ${
                           isSelected
                             ? 'bg-emerald-600 text-white border-emerald-600'
                             : person.allPaid
                             ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : person.partiallyPaid
+                            ? 'bg-sky-50 text-sky-700 border-sky-200'
                             : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-emerald-50 hover:text-emerald-700'
                         }`}
                       >
@@ -2158,7 +2311,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                             {person.displayName}
                           </h3>
                           <span
-                            className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
+                            className={`text-xs font-bold px-2.5 py-0.5 rounded-full border font-money ${
                               person.allPaid
                                 ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
                                 : person.partiallyPaid
@@ -2179,7 +2332,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           {person.items.map((subItem, idx) => (
                             <span
                               key={subItem.id}
-                              className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition ${
+                              className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition font-money ${
                                 subItem.paid
                                   ? 'bg-emerald-50/80 border-emerald-200 text-emerald-800 line-through opacity-70'
                                   : 'bg-slate-100 text-slate-700 border-slate-200'
@@ -2198,7 +2351,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           ))}
                         </div>
 
-                        <div className="pt-1 flex flex-wrap items-baseline gap-2">
+                        <div className="pt-1 flex flex-wrap items-baseline gap-2 font-money">
                           <span className="text-xs text-slate-500">
                             {person.allPaid
                               ? 'Tổng đã thanh toán: '
@@ -2227,10 +2380,14 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                               personKey: person.personKey,
                             })
                           }
-                          className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold text-sm px-5 py-3 rounded-xl shadow-sm transition"
+                          className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 font-bold text-sm px-5 py-3 rounded-xl transition active:scale-95 ${
+                            person.allPaid
+                              ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200'
+                              : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm'
+                          }`}
                         >
                           <QrCode className="w-5 h-5" />
-                          <span>Quét mã QR thanh toán</span>
+                          <span>{person.allPaid ? 'Xem lại mã QR' : 'Quét mã QR thanh toán'}</span>
                         </button>
                       </div>
                     </div>
@@ -2670,7 +2827,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                   }`}
                 >
                   <UserPlus className="w-4 h-4 shrink-0" />
-                  <span>Nhập tay</span>
+                  <span>Nhập / Chia đều</span>
                 </button>
 
                 <button
@@ -2714,33 +2871,125 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
               </div>
 
               <div className="p-5">
-                {/* TAB 1: NHẬP TAY (MANUAL) */}
+                {/* TAB 1: NHẬP TAY 1 NGƯỜI & CHIA ĐỀU NHIỀU NGƯỜI (QUICK SPLIT BILL) */}
                 {activeTab === 'manual' && (
                   <form onSubmit={handleManualSubmit} className="space-y-4">
+                    {/* Sub-mode Toggle: Nhập 1 người vs Chia đều nhiều người */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                      <div className="inline-flex rounded-xl bg-slate-100 p-1 text-xs font-semibold">
+                        <button
+                          type="button"
+                          onClick={() => setIsSplitMode(false)}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition ${
+                            !isSplitMode
+                              ? 'bg-white text-indigo-600 shadow-2xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <UserPlus className="w-3.5 h-3.5" />
+                          <span>Nhập từng người</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsSplitMode(true);
+                            if (selectedSplitNames.length === 0 && savedTeammates.length > 0) {
+                              setSelectedSplitNames(savedTeammates.slice(0, 2));
+                            }
+                          }}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition ${
+                            isSplitMode
+                              ? 'bg-indigo-600 text-white shadow-2xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <Calculator className="w-3.5 h-3.5" />
+                          <span>Chia đều nhiều người</span>
+                        </button>
+                      </div>
+
+                      {isSplitMode && (
+                        <div className="inline-flex rounded-lg bg-indigo-50 p-0.5 text-[11px] font-semibold border border-indigo-100">
+                          <button
+                            type="button"
+                            onClick={() => setSplitCalcType('divide')}
+                            className={`px-2.5 py-1 rounded-md transition ${
+                              splitCalcType === 'divide'
+                                ? 'bg-indigo-600 text-white'
+                                : 'text-indigo-700 hover:bg-indigo-100/60'
+                            }`}
+                          >
+                            Chia từ Tổng Bill
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSplitCalcType('same')}
+                            className={`px-2.5 py-1 rounded-md transition ${
+                              splitCalcType === 'same'
+                                ? 'bg-indigo-600 text-white'
+                                : 'text-indigo-700 hover:bg-indigo-100/60'
+                            }`}
+                          >
+                            Đồng giá mỗi người
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div className="space-y-3">
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                            Tên đồng nghiệp / Người đặt
-                          </label>
-                          <input
-                            type="text"
-                            value={manualName}
-                            onChange={(e) => setManualName(e.target.value)}
-                            placeholder="VD: anh Tài, anh Hà, anh Thành, Linh..."
-                            className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
-                          />
-                        </div>
+                        {!isSplitMode ? (
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                              Tên đồng nghiệp / Người đặt
+                            </label>
+                            <input
+                              type="text"
+                              value={manualName}
+                              onChange={(e) => setManualName(e.target.value)}
+                              placeholder="VD: anh Tài, anh Hà, c Phương, Linh..."
+                              className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
+                            />
+                          </div>
+                        ) : (
+                          <div className="bg-indigo-50/60 border border-indigo-100 rounded-xl p-3">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-xs font-bold text-indigo-950">
+                                Đang chọn: {selectedSplitNames.length} người
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSelectedSplitNames(
+                                    selectedSplitNames.length === savedTeammates.length
+                                      ? []
+                                      : [...savedTeammates]
+                                  )
+                                }
+                                className="text-[11px] font-semibold text-indigo-600 hover:underline"
+                              >
+                                {selectedSplitNames.length === savedTeammates.length
+                                  ? 'Bỏ chọn hết'
+                                  : 'Chọn tất cả'}
+                              </button>
+                            </div>
+                            <p className="text-[11px] text-slate-600">
+                              {selectedSplitNames.length > 0
+                                ? selectedSplitNames.join(', ')
+                                : 'Hãy bấm chọn các tên bên dưới để chia tiền'}
+                            </p>
+                          </div>
+                        )}
 
                         <div>
                           <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                            Ghi chú món (Tuỳ chọn - tự động cộng dồn nếu trùng tên)
+                            Tên món / Ghi chú (Tuỳ chọn - tự động cộng dồn nếu trùng tên)
                           </label>
                           <input
                             type="text"
                             value={manualNote}
                             onChange={(e) => setManualNote(e.target.value)}
-                            placeholder="VD: Cơm sườn, Trà đào..."
+                            placeholder="VD: bún mọc, kebab, bánh đa trộn, nem chua..."
                             className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-xs text-slate-700 focus:border-indigo-500 outline-none"
                           />
                         </div>
@@ -2749,7 +2998,9 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                         <div>
                           <div className="flex items-center justify-between mb-1.5">
                             <span className="text-[11px] font-medium text-slate-500">
-                              Chọn nhanh đồng nghiệp:
+                              {isSplitMode
+                                ? 'Bấm chọn nhiều người cùng ăn món này:'
+                                : 'Chọn nhanh đồng nghiệp:'}
                             </span>
                             <button
                               type="button"
@@ -2766,6 +3017,16 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                                 type="text"
                                 value={newTeammateInput}
                                 onChange={(e) => setNewTeammateInput(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    // Modern Web Guidance (ime-safe-enter-submit): Do not submit while Vietnamese IME is composing
+                                    if (e.nativeEvent?.isComposing || e.isComposing || e.keyCode === 229) {
+                                      return;
+                                    }
+                                    handleAddTeammateChip(e);
+                                  }
+                                }}
                                 placeholder="Nhập tên muốn lưu..."
                                 className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1 text-xs outline-none focus:border-indigo-500"
                               />
@@ -2781,8 +3042,11 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
 
                           <div className="flex flex-wrap gap-1.5">
                             {savedTeammates.map((teammate) => {
-                              const isSelected =
-                                normalizePersonKey(manualName) === normalizePersonKey(teammate);
+                              const isSelected = isSplitMode
+                                ? selectedSplitNames.some(
+                                    (n) => normalizePersonKey(n) === normalizePersonKey(teammate)
+                                  )
+                                : normalizePersonKey(manualName) === normalizePersonKey(teammate);
                               return (
                                 <span
                                   key={teammate}
@@ -2791,8 +3055,13 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                                       ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
                                       : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-indigo-50 hover:text-indigo-700 hover:border-indigo-200'
                                   }`}
-                                  onClick={() => setManualName(teammate)}
+                                  onClick={() =>
+                                    isSplitMode
+                                      ? toggleSplitPersonSelection(teammate)
+                                      : setManualName(teammate)
+                                  }
                                 >
+                                  {isSplitMode && isSelected && <Check className="w-3 h-3 stroke-[3]" />}
                                   <span>{teammate}</span>
                                   <button
                                     type="button"
@@ -2817,16 +3086,47 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                       {/* Ô nhập Số tiền */}
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                          Số tiền cần thu (VNĐ)
+                          {isSplitMode
+                            ? splitCalcType === 'divide'
+                              ? 'Tổng tiền hóa đơn cần chia đều (VNĐ)'
+                              : 'Số tiền đồng giá mỗi người (VNĐ)'
+                            : 'Số tiền cần thu (VNĐ)'}
                         </label>
                         <input
                           type="text"
                           inputMode="numeric"
                           value={manualAmount}
                           onChange={(e) => setManualAmount(e.target.value)}
-                          placeholder="VD: 75815 hoặc 45.000 hoặc 50k..."
-                          className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
+                          placeholder={
+                            isSplitMode && splitCalcType === 'divide'
+                              ? 'VD: 95468 (chia 2 = 47.734đ/người) hoặc 250k...'
+                              : 'VD: 47734 hoặc 82.000 hoặc 50k...'
+                          }
+                          className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm font-money focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
                         />
+
+                        {/* Xem trước số tiền chia đều */}
+                        {isSplitMode &&
+                          selectedSplitNames.length > 0 &&
+                          parseMoneyValue(manualAmount) > 0 && (
+                            <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-xs text-emerald-900 flex items-center justify-between font-money">
+                              <span>
+                                {splitCalcType === 'divide'
+                                  ? `Chia đều cho ${selectedSplitNames.length} người:`
+                                  : `Đồng giá cho ${selectedSplitNames.length} người:`}
+                              </span>
+                              <strong className="text-sm text-emerald-700">
+                                {formatVND(
+                                  splitCalcType === 'divide'
+                                    ? Math.round(
+                                        parseMoneyValue(manualAmount) / selectedSplitNames.length
+                                      )
+                                    : parseMoneyValue(manualAmount)
+                                )}
+                                /người
+                              </strong>
+                            </div>
+                          )}
 
                         {/* Quick Amount Buttons (30k -> 60k) */}
                         <div className="mt-2.5">
@@ -2841,7 +3141,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                                   key={item.value}
                                   type="button"
                                   onClick={() => setManualAmount(String(item.value))}
-                                  className={`py-1.5 px-2 rounded-lg text-xs font-semibold border transition active:scale-95 ${
+                                  className={`py-1.5 px-2 rounded-lg text-xs font-semibold border transition active:scale-95 font-money ${
                                     isSelected
                                       ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
                                       : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-indigo-50 hover:text-indigo-600 hover:border-indigo-200'
@@ -2861,8 +3161,16 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                         type="submit"
                         className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white font-semibold text-sm px-6 py-2.5 rounded-xl shadow-sm transition"
                       >
-                        <UserPlus className="w-4 h-4" />
-                        <span>Thêm vào danh sách</span>
+                        {isSplitMode ? (
+                          <Calculator className="w-4 h-4" />
+                        ) : (
+                          <UserPlus className="w-4 h-4" />
+                        )}
+                        <span>
+                          {isSplitMode
+                            ? `Chia & Thêm cho ${selectedSplitNames.length} người`
+                            : 'Thêm vào danh sách'}
+                        </span>
                       </button>
                     </div>
                   </form>
@@ -3179,42 +3487,74 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                   </div>
                 </div>
 
-                {/* Bộ lọc trạng thái & Thao tác hàng loạt */}
+                {/* Bộ lọc trạng thái, Tìm kiếm nhanh & Thao tác hàng loạt */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                  <div className="inline-flex rounded-xl bg-slate-100 p-1 text-xs font-semibold">
-                    <button
-                      type="button"
-                      onClick={() => setFilterStatus('all')}
-                      className={`px-2.5 py-1 rounded-lg transition ${
-                        filterStatus === 'all'
-                          ? 'bg-white text-slate-900 shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Tất cả
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFilterStatus('unpaid')}
-                      className={`px-2.5 py-1 rounded-lg transition ${
-                        filterStatus === 'unpaid'
-                          ? 'bg-white text-amber-700 shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Chưa trả
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFilterStatus('paid')}
-                      className={`px-2.5 py-1 rounded-lg transition ${
-                        filterStatus === 'paid'
-                          ? 'bg-white text-emerald-700 shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Đã trả
-                    </button>
+                  <div className="flex flex-wrap items-center gap-2 flex-1 min-w-0">
+                    <div className="inline-flex rounded-xl bg-slate-100 p-1 text-xs font-semibold shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('all')}
+                        className={`px-2.5 py-1 rounded-lg transition ${
+                          filterStatus === 'all'
+                            ? 'bg-white text-slate-900 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Tất cả (
+                        {viewMode === 'grouped' ? aggregatedPeople.length : participants.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('unpaid')}
+                        className={`px-2.5 py-1 rounded-lg transition ${
+                          filterStatus === 'unpaid'
+                            ? 'bg-white text-amber-700 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Chưa trả (
+                        {viewMode === 'grouped'
+                          ? aggregatedPeople.filter((p) => !p.allPaid).length
+                          : participants.filter((p) => !p.paid).length}
+                        )
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('paid')}
+                        className={`px-2.5 py-1 rounded-lg transition ${
+                          filterStatus === 'paid'
+                            ? 'bg-white text-emerald-700 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Đã trả (
+                        {viewMode === 'grouped'
+                          ? aggregatedPeople.filter((p) => p.allPaid).length
+                          : participants.filter((p) => p.paid).length}
+                        )
+                      </button>
+                    </div>
+
+                    {/* Ô tìm kiếm nhanh tên người hoặc tên món */}
+                    <div className="relative flex-1 min-w-[160px] max-w-xs">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
+                      <input
+                        type="text"
+                        value={hostSearchQuery}
+                        onChange={(e) => setHostSearchQuery(e.target.value)}
+                        placeholder="Lọc tên người hoặc món..."
+                        className="w-full rounded-xl border border-slate-200 bg-slate-50/80 pl-8 pr-7 py-1 text-xs text-slate-800 focus:bg-white focus:border-indigo-500 outline-none"
+                      />
+                      {hostSearchQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setHostSearchQuery('')}
+                          className="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {participants.length > 0 && (
@@ -3240,17 +3580,77 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                       <button
                         type="button"
                         onClick={clearAllParticipants}
-                        className="text-xs font-semibold text-rose-600 hover:bg-rose-50 px-2.5 py-1.5 rounded-lg transition"
+                        className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition ${
+                          confirmClearAll
+                            ? 'bg-rose-600 text-white shadow-xs animate-pulse'
+                            : 'text-rose-600 hover:bg-rose-50'
+                        }`}
                       >
-                        Xoá hết
+                        {confirmClearAll ? 'Xác nhận xoá hết?' : 'Xoá hết'}
                       </button>
                     </div>
                   )}
                 </div>
               </div>
 
+              {/* Khung chỉnh sửa trực tiếp khoản thu (Inline Edit Bar) */}
+              {editingItem && (
+                <form
+                  onSubmit={handleSaveEditedItem}
+                  className="bg-indigo-50/90 border-b border-indigo-200 px-4 py-3 flex flex-wrap items-center gap-2 text-xs"
+                >
+                  <span className="font-bold text-indigo-950 flex items-center gap-1 shrink-0">
+                    <Pencil className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Sửa khoản:</span>
+                  </span>
+                  <input
+                    type="text"
+                    value={editingItem.name}
+                    onChange={(e) =>
+                      setEditingItem((prev) => ({ ...prev, name: e.target.value }))
+                    }
+                    placeholder="Tên người"
+                    className="w-28 sm:w-32 rounded-lg border border-indigo-300 bg-white px-2.5 py-1.5 font-semibold text-slate-900 outline-none focus:border-indigo-600"
+                  />
+                  <input
+                    type="text"
+                    value={editingItem.note}
+                    onChange={(e) =>
+                      setEditingItem((prev) => ({ ...prev, note: e.target.value }))
+                    }
+                    placeholder="Tên món / Ghi chú"
+                    className="flex-1 min-w-[120px] rounded-lg border border-indigo-300 bg-white px-2.5 py-1.5 text-slate-800 outline-none focus:border-indigo-600"
+                  />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={editingItem.amount}
+                    onChange={(e) =>
+                      setEditingItem((prev) => ({ ...prev, amount: e.target.value }))
+                    }
+                    placeholder="Số tiền"
+                    className="w-28 rounded-lg border border-indigo-300 bg-white px-2.5 py-1.5 font-bold font-money text-indigo-700 outline-none focus:border-indigo-600"
+                  />
+                  <div className="flex items-center gap-1.5 ml-auto">
+                    <button
+                      type="submit"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3 py-1.5 rounded-lg transition"
+                    >
+                      Lưu sửa
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingItem(null)}
+                      className="bg-white hover:bg-slate-100 text-slate-600 border border-slate-300 font-semibold px-2.5 py-1.5 rounded-lg transition"
+                    >
+                      Huỷ
+                    </button>
+                  </div>
+                </form>
+              )}
+
               {/* Nút Khôi phục nhanh 11 món (có c Phương) đã nhập trước đó nếu người dùng cần */}
-              {participants.length < 11 && (
+              {!hideRecoveryBanner && participants.length < 11 && (
                 <div className="bg-amber-50 border-b border-amber-200/80 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-2 text-amber-900">
                     <RotateCcw className="w-4 h-4 text-amber-600 shrink-0" />
@@ -3258,22 +3658,32 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                       Dữ liệu bị mất trước đó? Có sẵn bản lưu <strong>11 món</strong> (anh Tài, anh Hà, c Phương, Linh, anh Thành).
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setParticipants(SAVED_SESSION_BACKUP_ITEMS);
-                      setHostSettings((prev) => ({
-                        ...prev,
-                        bankBin: '970422',
-                        accountNumber: '0925113116',
-                        accountName: 'NGOTIENCONG',
-                      }));
-                      showToast('Đã khôi phục thành công 11 món ăn (có c Phương)!');
-                    }}
-                    className="font-bold text-amber-900 bg-amber-200/90 hover:bg-amber-300 px-3 py-1 rounded-lg transition active:scale-95 shadow-xs"
-                  >
-                    Khôi phục 11 món ngay
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setParticipants(SAVED_SESSION_BACKUP_ITEMS);
+                        setHostSettings((prev) => ({
+                          ...prev,
+                          bankBin: '970422',
+                          accountNumber: '0925113116',
+                          accountName: 'NGOTIENCONG',
+                        }));
+                        showToast('Đã khôi phục thành công 11 món ăn (có c Phương)!');
+                      }}
+                      className="font-bold text-amber-900 bg-amber-200/90 hover:bg-amber-300 px-3 py-1 rounded-lg transition active:scale-95 shadow-xs"
+                    >
+                      Khôi phục 11 món ngay
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHideRecoveryBanner(true)}
+                      className="text-amber-700 hover:bg-amber-200/60 p-1 rounded-lg transition"
+                      title="Ẩn thông báo này"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -3377,7 +3787,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                                 {person.items.map((subItem, idx) => (
                                   <div
                                     key={subItem.id}
-                                    className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition ${
+                                    className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition font-money ${
                                       subItem.paid
                                         ? 'bg-emerald-50/70 border-emerald-200 text-emerald-800 line-through opacity-75'
                                         : 'bg-slate-100/80 border-slate-200 text-slate-700'
@@ -3393,6 +3803,21 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                                         {subItem.note || `Khoản #${idx + 1}`}:{' '}
                                         <strong>{formatVND(subItem.amount)}</strong>
                                       </span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setEditingItem({
+                                          id: subItem.id,
+                                          name: subItem.name,
+                                          note: subItem.note || '',
+                                          amount: String(subItem.amount),
+                                        })
+                                      }
+                                      className="text-slate-400 hover:text-indigo-600 p-0.5 rounded"
+                                      title="Sửa món / số tiền này"
+                                    >
+                                      <Pencil className="w-3 h-3" />
                                     </button>
                                     <button
                                       type="button"
@@ -3510,7 +3935,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                               </button>
                             </div>
                             <p
-                              className={`text-sm font-extrabold mt-0.5 ${
+                              className={`text-sm font-extrabold font-money mt-0.5 ${
                                 participant.paid ? 'text-emerald-600/70' : 'text-indigo-600'
                               }`}
                             >
@@ -3519,7 +3944,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           </div>
                         </div>
 
-                        <div className="flex items-center justify-end gap-2 shrink-0">
+                        <div className="flex items-center justify-end gap-1.5 shrink-0">
                           <button
                             type="button"
                             onClick={() =>
@@ -3532,6 +3957,22 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           >
                             <QrCode className="w-4 h-4" />
                             <span>Hiện mã QR</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditingItem({
+                                id: participant.id,
+                                name: participant.name,
+                                note: participant.note || '',
+                                amount: String(participant.amount),
+                              })
+                            }
+                            className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition"
+                            title="Sửa mục này"
+                          >
+                            <Pencil className="w-4 h-4" />
                           </button>
 
                           <button
@@ -3642,7 +4083,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           ? 'Tổng số tiền cần thanh toán'
                           : 'Số tiền chính xác'}
                       </span>
-                      <p className="text-xl font-extrabold text-indigo-600">
+                      <p className="text-xl font-extrabold text-indigo-600 font-money">
                         {formatVND(liveQrData.amount)}
                       </p>
                       <p className="text-xs text-slate-600 mt-1">
@@ -3652,9 +4093,46 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                         </code>
                       </p>
 
+                      {/* Nút Copy nhanh STK / Số tiền / Nội dung cho người dùng điện thoại */}
+                      <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyText(hostSettings.accountNumber, 'Số tài khoản')
+                          }
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 px-2.5 py-1 rounded-lg border border-slate-200 transition"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>Copy STK</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyText(String(liveQrData.amount), 'Số tiền chuyển khoản')
+                          }
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 px-2.5 py-1 rounded-lg border border-slate-200 transition font-money"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>Copy Số tiền</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyText(
+                              `${removeVietnameseTones(liveQrData.name).slice(0, 28) || 'Ban'} thanh toan`,
+                              'Nội dung CK'
+                            )
+                          }
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 px-2.5 py-1 rounded-lg border border-slate-200 transition"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>Copy Nội dung</span>
+                        </button>
+                      </div>
+
                       {/* Chi tiết các món cấu thành trong QR Tổng */}
                       {liveQrData.items?.length > 1 && (
-                        <div className="mt-3 pt-2.5 border-t border-slate-200/80 text-left">
+                        <div className="mt-3 pt-2.5 border-t border-slate-200/80 text-left font-money">
                           <p className="text-[11px] font-semibold text-slate-500 mb-1">
                             Chi tiết các khoản của {liveQrData.name}:
                           </p>
@@ -3681,6 +4159,11 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                       )}
                     </div>
                   </div>
+
+                  {/* Mẹo nhỏ trên điện thoại */}
+                  <p className="text-[11px] text-center text-slate-500">
+                    💡 Mẹo trên điện thoại: Bấm <strong>Tải ảnh QR</strong> rồi mở App Ngân hàng → Chọn ảnh từ Thư viện.
+                  </p>
 
                   {/* Action Buttons inside Modal */}
                   <div className="grid grid-cols-2 gap-2.5">
