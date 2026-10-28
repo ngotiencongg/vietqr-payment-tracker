@@ -77,12 +77,22 @@ const LEGACY_DEFAULT_TEAMMATES = new Set(['nam', 'hùng', 'trang', 'minh', 'hư�
 
 const DEFAULT_HOST_SETTINGS = {
   bankBin: '970422',
-  accountNumber: '',
-  accountName: '',
+  accountNumber: '0925113116',
+  accountName: 'NGOTIENCONG',
   geminiApiKey: '',
   firebaseUrl: '',
   customRoomName: '',
 };
+
+// Bản lưu trữ dữ liệu an toàn phục vụ khôi phục tức thì
+const SAVED_SESSION_BACKUP_ITEMS = [
+  { id: 'rec-1', name: 'anh Tài', note: 'kebab', amount: 75815, paid: false },
+  { id: 'rec-2', name: 'anh Hà', note: 'cơm bò', amount: 63308, paid: false },
+  { id: 'rec-3', name: 'Linh', note: 'nem chua', amount: 53000, paid: false },
+  { id: 'rec-4', name: 'anh Thành', note: 'nem chua', amount: 88000, paid: true },
+  { id: 'rec-5', name: 'anh Tài', note: 'nem chua', amount: 88000, paid: false },
+  { id: 'rec-6', name: 'anh Tài', note: 'shopee', amount: 239000, paid: false },
+];
 
 const STORAGE_KEYS = {
   HOST_SETTINGS: 'vietqr_lunch_tracker_host_settings_v1',
@@ -615,7 +625,13 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return { ...DEFAULT_HOST_SETTINGS, ...parsed };
+          return {
+            ...DEFAULT_HOST_SETTINGS,
+            ...parsed,
+            bankBin: parsed.bankBin || DEFAULT_HOST_SETTINGS.bankBin,
+            accountNumber: parsed.accountNumber || DEFAULT_HOST_SETTINGS.accountNumber,
+            accountName: parsed.accountName || DEFAULT_HOST_SETTINGS.accountName,
+          };
         }
       }
     } catch (e) {
@@ -634,7 +650,7 @@ export default function App() {
     } catch {
       // ignore
     }
-    return true;
+    return false;
   });
 
   const [showApiKey, setShowApiKey] = useState(false);
@@ -643,24 +659,18 @@ export default function App() {
     if (Array.isArray(sharedUrlParams.payload?.items)) {
       return sharedUrlParams.payload.items;
     }
-    const defaultStarterList = [
-      { id: 'member-1', name: 'anh Tài', note: 'Cơm sườn', amount: 45000, paid: false },
-      { id: 'member-2', name: 'anh Tài', note: 'Trà đào', amount: 25000, paid: false },
-      { id: 'member-3', name: 'anh Hà', note: 'Phở bò', amount: 50000, paid: false },
-      { id: 'member-4', name: 'anh Thành', note: 'Bún chả', amount: 45000, paid: false },
-      { id: 'member-5', name: 'Linh', note: 'Bún bò', amount: 50000, paid: true },
-    ];
+    const defaultStarterList = SAVED_SESSION_BACKUP_ITEMS;
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.PARTICIPANTS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          // Nếu đang là dữ liệu demo cũ chưa chỉnh sửa (demo-1: Nam), tự động nâng cấp sang danh sách thành viên mới
-          const isUntouchedLegacyDemo =
-            parsed.length === 3 &&
-            parsed.every((item) => String(item.id).startsWith('demo-')) &&
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Nếu đang là dữ liệu demo mẫu cũ (Cơm sườn, Trà đào... hoặc Nam), tự động khôi phục sang danh sách thật
+          const isOldPlaceholder =
+            (parsed.some((item) => item.note === 'Cơm sườn') &&
+             parsed.some((item) => item.note === 'Trà đào')) ||
             parsed.some((item) => item.name === 'Nam');
-          return isUntouchedLegacyDemo ? defaultStarterList : parsed;
+          return isOldPlaceholder ? defaultStarterList : parsed;
         }
       }
     } catch (e) {
@@ -2544,6 +2554,25 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                       <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
+                          onClick={() => {
+                            setParticipants(SAVED_SESSION_BACKUP_ITEMS);
+                            setHostSettings((prev) => ({
+                              ...prev,
+                              bankBin: '970422',
+                              accountNumber: '0925113116',
+                              accountName: 'NGOTIENCONG',
+                            }));
+                            showToast('Đã khôi phục 6 món ăn đã nhập trước đó!');
+                          }}
+                          className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 transition"
+                          title="Khôi phục lại danh sách 6 khoản (anh Tài, anh Hà, Linh, anh Thành)"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Khôi phục 6 món đã nhập</span>
+                        </button>
+
+                        <button
+                          type="button"
                           onClick={handleExportBackup}
                           className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition"
                           title="Tải file sao lưu JSON về máy tính"
@@ -3188,6 +3217,34 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                   )}
                 </div>
               </div>
+
+              {/* Nút Khôi phục nhanh 6 món đã nhập trước đó nếu người dùng cần */}
+              {participants.length < 6 && (
+                <div className="bg-amber-50 border-b border-amber-200/80 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-amber-900">
+                    <RotateCcw className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      Dữ liệu bị mất trước đó? Có sẵn bản lưu <strong>6 món</strong> (anh Tài, anh Hà, Linh, anh Thành).
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setParticipants(SAVED_SESSION_BACKUP_ITEMS);
+                      setHostSettings((prev) => ({
+                        ...prev,
+                        bankBin: '970422',
+                        accountNumber: '0925113116',
+                        accountName: 'NGOTIENCONG',
+                      }));
+                      showToast('Đã khôi phục thành công 6 món ăn đã nhập trước đó!');
+                    }}
+                    className="font-bold text-amber-900 bg-amber-200/90 hover:bg-amber-300 px-3 py-1 rounded-lg transition active:scale-95 shadow-xs"
+                  >
+                    Khôi phục 6 món ngay
+                  </button>
+                </div>
+              )}
 
               {/* DANH SÁCH CHẾ ĐỘ 1: TỔNG HỢP THEO TỪNG NGƯỜI (GROUPED VIEW) */}
               {viewMode === 'grouped' ? (
