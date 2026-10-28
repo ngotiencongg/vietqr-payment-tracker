@@ -39,6 +39,8 @@ import {
   FileCheck2,
   Cloud,
   Link2,
+  HardDrive,
+  RotateCcw,
 } from 'lucide-react';
 
 // Danh sách ngân hàng phổ biến hỗ trợ VietQR (BIN & ShortName)
@@ -88,6 +90,7 @@ const STORAGE_KEYS = {
   TEAMMATES: 'vietqr_lunch_tracker_teammates_v2',
   VIEW_MODE: 'vietqr_lunch_tracker_view_mode_v1',
   CLOUD_ROOM_ID: 'vietqr_lunch_tracker_cloud_room_id_v1',
+  BACKUP_SNAPSHOT: 'vietqr_lunch_tracker_backup_snapshot_v1',
 };
 
 // Sử dụng model gemini-3.8-flash hiện hành thay cho gemini-1.5-flash đã ngừng hỗ trợ
@@ -507,7 +510,7 @@ export function buildVietQrUrl({ bankBin, accountNumber, accountName, amount, pa
 }
 
 /**
- * Đồng bộ dữ liệu phòng lên Cloud (Hỗ trợ Firebase Realtime DB hoặc REST Cloud công cộng miễn phí)
+ * Đồng bộ dữ liệu phòng lên Cloud (Hỗ trợ Firebase Realtime DB)
  */
 export async function syncRoomToCloud({ roomId, host, items, firebaseUrl, customRoomName }) {
   if (firebaseUrl && firebaseUrl.trim()) {
@@ -522,54 +525,45 @@ export async function syncRoomToCloud({ roomId, host, items, firebaseUrl, custom
     if (!res.ok) throw new Error('Không thể đồng bộ tới Firebase');
     return roomKey;
   }
-
-  const payload = {
-    name: 'vietqr_room',
-    data: { host, items, updatedAt: Date.now() },
-  };
-
-  if (roomId && !roomId.startsWith('demo-')) {
-    try {
-      const res = await fetch(`https://api.restful-api.dev/objects/${roomId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) return roomId;
-    } catch {
-      // nếu không cập nhật được thì tạo mới bên dưới
-    }
-  }
-
-  const res = await fetch('https://api.restful-api.dev/objects', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error('Không thể tạo phòng trên Cloud');
-  const data = await res.json();
-  return data.id;
+  return roomId || '';
 }
 
 /**
  * Đọc dữ liệu phòng từ Cloud
  */
 export async function fetchRoomFromCloud({ roomId, firebaseUrl }) {
-  if (!roomId) return null;
+  if (!roomId || !firebaseUrl || !firebaseUrl.trim()) return null;
+  const cleanUrl = firebaseUrl.trim().replace(/\/+$/, '');
+  const endpoint = `${cleanUrl}/rooms/${encodeURIComponent(roomId)}.json`;
+  const res = await fetch(endpoint);
+  if (!res.ok) throw new Error('Không tìm thấy phòng trên Firebase');
+  const data = await res.json();
+  return data;
+}
 
-  if (firebaseUrl && firebaseUrl.trim()) {
-    const cleanUrl = firebaseUrl.trim().replace(/\/+$/, '');
-    const endpoint = `${cleanUrl}/rooms/${encodeURIComponent(roomId)}.json`;
-    const res = await fetch(endpoint);
-    if (!res.ok) throw new Error('Không tìm thấy phòng trên Firebase');
-    const data = await res.json();
-    return data;
+/**
+ * Rút gọn đường dẫn qua dịch vụ spoo.me (Hỗ trợ CORS trực tiếp từ trình duyệt)
+ */
+export async function shortenUrl(longUrl) {
+  try {
+    const res = await fetch('https://spoo.me', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ url: longUrl }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.short_url) {
+        return data.short_url.replace(/^http:/, 'https:');
+      }
+    }
+  } catch (err) {
+    console.warn('spoo.me error, fallback to long url:', err);
   }
-
-  const res = await fetch(`https://api.restful-api.dev/objects/${encodeURIComponent(roomId)}`);
-  if (!res.ok) throw new Error('Không tìm thấy phòng');
-  const obj = await res.json();
-  return obj?.data || null;
+  return longUrl;
 }
 
 export default function App() {
@@ -585,8 +579,11 @@ export default function App() {
     const modeParam = params.get('role');
     const decoded = decodeSharePayload(shareToken);
 
+    // Mở giao diện Người trả tiền nếu có role=payer, hoặc có ?pay=, hoặc có ?share= (và không chỉ định role=host)
+    const isPayerLink = modeParam === 'payer' || Boolean(roomParam) || (Boolean(decoded) && modeParam !== 'host');
+
     return {
-      isSharedLink: Boolean(decoded) || Boolean(roomParam) || modeParam === 'payer',
+      isSharedLink: isPayerLink,
       isCloudRoom: Boolean(roomParam),
       roomId: roomParam,
       payload: decoded,
@@ -696,7 +693,7 @@ export default function App() {
     return DEFAULT_TEAMMATES;
   });
 
-  // Đảm bảo danh sách thành viên ['anh Tài', 'anh Hà', 'anh Thành', 'Linh'] luôn được cập nhật ngay cả khi Hot Reload
+  // Đảm bảo danh sách thành viên ['anh Tài', 'anh Hà', 'anh Thành', 'Linh'] luôn có sẵn trong gợi ý
   useEffect(() => {
     setSavedTeammates((prev) => {
       const merged = [...DEFAULT_TEAMMATES];
@@ -709,21 +706,6 @@ export default function App() {
         }
       }
       return merged;
-    });
-
-    setParticipants((prev) => {
-      const isUntouchedLegacyDemo =
-        prev.length === 3 &&
-        prev.every((item) => String(item.id).startsWith('demo-')) &&
-        prev.some((item) => item.name === 'Nam');
-      if (!isUntouchedLegacyDemo) return prev;
-      return [
-        { id: 'member-1', name: 'anh Tài', note: 'Cơm sườn', amount: 45000, paid: false },
-        { id: 'member-2', name: 'anh Tài', note: 'Trà đào', amount: 25000, paid: false },
-        { id: 'member-3', name: 'anh Hà', note: 'Phở bò', amount: 50000, paid: false },
-        { id: 'member-4', name: 'anh Thành', note: 'Bún chả', amount: 45000, paid: false },
-        { id: 'member-5', name: 'Linh', note: 'Bún bò', amount: 50000, paid: true },
-      ];
     });
   }, []);
 
@@ -748,9 +730,9 @@ export default function App() {
   const [isSyncingCloud, setIsSyncingCloud] = useState(false);
   const [cloudSyncStatus, setCloudSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'synced' | 'error'
 
-  // Khi Người trả tiền mở Link Khách (?pay=... hoặc ?room=...), tự động tải dữ liệu từ Cloud
+  // Khi Người trả tiền mở Link Khách có kết nối Firebase, định kỳ tải cập nhật từ chủ trì
   useEffect(() => {
-    if (!sharedUrlParams.isCloudRoom || !sharedUrlParams.roomId) return;
+    if (!sharedUrlParams.isCloudRoom || !sharedUrlParams.roomId || !hostSettings.firebaseUrl) return;
 
     let isMounted = true;
     const loadCloudRoomData = async () => {
@@ -773,13 +755,12 @@ export default function App() {
           setParticipants(cloudData.items);
         }
       } catch (err) {
-        console.error('Không thể tải phòng từ Cloud:', err);
+        console.error('Không thể tải phòng từ Firebase:', err);
       }
     };
 
     loadCloudRoomData();
 
-    // Định kỳ tải cập nhật mới nhất từ chủ trì (mỗi 7 giây)
     const interval = setInterval(loadCloudRoomData, 7000);
     return () => {
       isMounted = false;
@@ -787,9 +768,9 @@ export default function App() {
     };
   }, [sharedUrlParams.isCloudRoom, sharedUrlParams.roomId, hostSettings.firebaseUrl]);
 
-  // Nếu là Chủ trì và đã có phòng Cloud, định kỳ lắng nghe xác nhận chuyển tiền từ khách (mỗi 9 giây)
+  // Nếu là Chủ trì và đã cấu hình Firebase, định kỳ lắng nghe xác nhận chuyển tiền từ khách
   useEffect(() => {
-    if (appRole !== 'host' || !cloudRoomId || sharedUrlParams.isCloudRoom) return;
+    if (appRole !== 'host' || !hostSettings.firebaseUrl || (!cloudRoomId && !hostSettings.customRoomName)) return;
 
     let isMounted = true;
     const pollPayerUpdates = async () => {
@@ -832,12 +813,12 @@ export default function App() {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [appRole, cloudRoomId, hostSettings.customRoomName, hostSettings.firebaseUrl, sharedUrlParams.isCloudRoom]);
+  }, [appRole, cloudRoomId, hostSettings.customRoomName, hostSettings.firebaseUrl]);
 
   // Đồng bộ thời gian thực giữa 2 tab trên cùng trình duyệt (Storage Event)
   useEffect(() => {
     const handleStorageChange = (e) => {
-      if (e.key === STORAGE_KEYS.PARTICIPANTS && e.newValue) {
+      if (appRole === 'host' && e.key === STORAGE_KEYS.PARTICIPANTS && e.newValue) {
         try {
           const parsed = JSON.parse(e.newValue);
           if (Array.isArray(parsed)) setParticipants(parsed);
@@ -848,34 +829,58 @@ export default function App() {
     };
     window.addEventListener('storage', handleStorageChange);
     return () => window.removeEventListener('storage', handleStorageChange);
-  }, []);
+  }, [appRole]);
+
+  // =========================================================================
+  // BẢO VỆ DỮ LIỆU CHỦ TRÌ TUYỆT ĐỐI (LUÔN LƯU VÀO LOCALSTORAGE & DỌN SẠCH URL)
+  // =========================================================================
+  useEffect(() => {
+    if (appRole === 'host') {
+      try {
+        localStorage.setItem(STORAGE_KEYS.HOST_SETTINGS, JSON.stringify(hostSettings));
+      } catch (e) {
+        console.error('Không thể lưu cài đặt:', e);
+      }
+    }
+  }, [hostSettings, appRole]);
 
   useEffect(() => {
-    if (sharedUrlParams.payload) return;
-    try {
-      localStorage.setItem(STORAGE_KEYS.HOST_SETTINGS, JSON.stringify(hostSettings));
-    } catch (e) {
-      console.error('Không thể lưu cài đặt:', e);
+    if (appRole === 'host') {
+      try {
+        localStorage.setItem(STORAGE_KEYS.PARTICIPANTS, JSON.stringify(participants));
+        if (participants.length > 0) {
+          localStorage.setItem(
+            STORAGE_KEYS.BACKUP_SNAPSHOT,
+            JSON.stringify({
+              timestamp: Date.now(),
+              host: hostSettings,
+              items: participants,
+            })
+          );
+        }
+      } catch (e) {
+        console.error('Không thể lưu danh sách người tham gia:', e);
+      }
     }
-  }, [hostSettings, sharedUrlParams.payload]);
+  }, [participants, hostSettings, appRole]);
 
   useEffect(() => {
-    if (sharedUrlParams.payload) return;
-    try {
-      localStorage.setItem(STORAGE_KEYS.PARTICIPANTS, JSON.stringify(participants));
-    } catch (e) {
-      console.error('Không thể lưu danh sách người tham gia:', e);
+    if (appRole === 'host') {
+      try {
+        localStorage.setItem(STORAGE_KEYS.TEAMMATES, JSON.stringify(savedTeammates));
+      } catch (e) {
+        console.error('Không thể lưu danh sách đồng nghiệp:', e);
+      }
     }
-  }, [participants, sharedUrlParams.payload]);
+  }, [savedTeammates, appRole]);
 
+  // Khi ở Giao diện của Tôi (Chủ trì), tự động dọn sạch mọi tham số loằng ngoằng trên URL
   useEffect(() => {
-    if (sharedUrlParams.payload) return;
-    try {
-      localStorage.setItem(STORAGE_KEYS.TEAMMATES, JSON.stringify(savedTeammates));
-    } catch (e) {
-      console.error('Không thể lưu danh sách đồng nghiệp:', e);
+    if (appRole === 'host' && typeof window !== 'undefined' && window.location.search) {
+      const cleanUrl = window.location.origin + window.location.pathname;
+      window.history.replaceState({}, '', cleanUrl);
     }
-  }, [savedTeammates, sharedUrlParams.payload]);
+  }, [appRole]);
 
   useEffect(() => {
     try {
@@ -1114,6 +1119,7 @@ export default function App() {
     };
     const token = encodeSharePayload(shareData);
     const url = new URL(window.location.origin + window.location.pathname);
+    url.searchParams.set('role', 'payer'); // Luôn mở thẳng vào giao diện Người trả tiền
     url.searchParams.set('share', token);
     if (specificPersonName) {
       url.searchParams.set('person', specificPersonName);
@@ -1121,54 +1127,70 @@ export default function App() {
     return url.toString();
   };
 
-  // Tạo & sao chép Link Khách siêu ngắn dạng ?pay=room_id
+  // Tạo & sao chép Link Khách siêu ngắn để gửi vào Zalo
   const handleCopyCustomerLink = async (specificPersonName = '') => {
     setIsSyncingCloud(true);
     setCloudSyncStatus('syncing');
     try {
-      const targetRoomKey = hostSettings.customRoomName || cloudRoomId;
+      // 1. Nếu có cấu hình Firebase, tạo link phòng Firebase
+      if (hostSettings.firebaseUrl && hostSettings.firebaseUrl.trim()) {
+        const targetRoomKey = hostSettings.customRoomName || cloudRoomId || 'phong-' + Math.random().toString(36).slice(2, 8);
+        const newRoomId = await syncRoomToCloud({
+          roomId: targetRoomKey,
+          host: {
+            bankBin: hostSettings.bankBin,
+            accountNumber: hostSettings.accountNumber,
+            accountName: hostSettings.accountName,
+          },
+          items: participants,
+          firebaseUrl: hostSettings.firebaseUrl,
+          customRoomName: hostSettings.customRoomName,
+        });
 
-      const newRoomId = await syncRoomToCloud({
-        roomId: targetRoomKey,
-        host: {
-          bankBin: hostSettings.bankBin,
-          accountNumber: hostSettings.accountNumber,
-          accountName: hostSettings.accountName,
-        },
-        items: participants,
-        firebaseUrl: hostSettings.firebaseUrl,
-        customRoomName: hostSettings.customRoomName,
-      });
-
-      if (newRoomId && newRoomId !== cloudRoomId) {
-        setCloudRoomId(newRoomId);
-        try {
-          localStorage.setItem(STORAGE_KEYS.CLOUD_ROOM_ID, newRoomId);
-        } catch {
-          // ignore
+        if (newRoomId && newRoomId !== cloudRoomId) {
+          setCloudRoomId(newRoomId);
+          try {
+            localStorage.setItem(STORAGE_KEYS.CLOUD_ROOM_ID, newRoomId);
+          } catch {
+            // ignore
+          }
         }
+
+        const url = new URL(window.location.origin + window.location.pathname);
+        url.searchParams.set('role', 'payer');
+        url.searchParams.set('pay', newRoomId || targetRoomKey);
+        if (specificPersonName) {
+          url.searchParams.set('person', specificPersonName);
+        }
+
+        const shortLink = await shortenUrl(url.toString());
+        await navigator.clipboard.writeText(shortLink);
+        setCloudSyncStatus('synced');
+        showToast(
+          specificPersonName
+            ? `Đã chép Link ngắn cho ${specificPersonName}!`
+            : 'Đã sao chép Link Khách siêu ngắn để gửi vào Zalo!'
+        );
+        return;
       }
 
-      const activeId = newRoomId || cloudRoomId;
-      const url = new URL(window.location.origin + window.location.pathname);
-      url.searchParams.set('pay', activeId);
-      if (specificPersonName) {
-        url.searchParams.set('person', specificPersonName);
-      }
+      // 2. Chế độ tiêu chuẩn (Không cần cấu hình, dữ liệu tự chứa vĩnh viễn không bao giờ mất):
+      const fullCustomerUrl = buildShareUrl(specificPersonName);
+      const shortLink = await shortenUrl(fullCustomerUrl);
 
-      await navigator.clipboard.writeText(url.toString());
+      await navigator.clipboard.writeText(shortLink);
       setCloudSyncStatus('synced');
       showToast(
         specificPersonName
-          ? `Đã chép Link thanh toán riêng cho ${specificPersonName}!`
+          ? `Đã chép Link ngắn cho ${specificPersonName}!`
           : 'Đã sao chép Link Khách siêu ngắn để gửi vào Zalo!'
       );
     } catch (err) {
-      console.error('Lỗi đồng bộ Cloud:', err);
+      console.error('Lỗi tạo link khách:', err);
       setCloudSyncStatus('error');
       const fallbackUrl = buildShareUrl(specificPersonName);
       await navigator.clipboard.writeText(fallbackUrl).catch(() => {});
-      showToast('Đã chép link thanh toán (chế độ dự phòng)!');
+      showToast('Đã chép link thanh toán!');
     } finally {
       setIsSyncingCloud(false);
     }
@@ -1179,32 +1201,27 @@ export default function App() {
     setIsSyncingCloud(true);
     let payUrl = '';
     try {
-      const targetRoomKey = hostSettings.customRoomName || cloudRoomId;
-      const newRoomId = await syncRoomToCloud({
-        roomId: targetRoomKey,
-        host: {
-          bankBin: hostSettings.bankBin,
-          accountNumber: hostSettings.accountNumber,
-          accountName: hostSettings.accountName,
-        },
-        items: participants,
-        firebaseUrl: hostSettings.firebaseUrl,
-        customRoomName: hostSettings.customRoomName,
-      });
-
-      if (newRoomId && newRoomId !== cloudRoomId) {
-        setCloudRoomId(newRoomId);
-        try {
-          localStorage.setItem(STORAGE_KEYS.CLOUD_ROOM_ID, newRoomId);
-        } catch {
-          // ignore
-        }
+      if (hostSettings.firebaseUrl && hostSettings.firebaseUrl.trim()) {
+        const targetRoomKey = hostSettings.customRoomName || cloudRoomId || 'phong-' + Math.random().toString(36).slice(2, 8);
+        const newRoomId = await syncRoomToCloud({
+          roomId: targetRoomKey,
+          host: {
+            bankBin: hostSettings.bankBin,
+            accountNumber: hostSettings.accountNumber,
+            accountName: hostSettings.accountName,
+          },
+          items: participants,
+          firebaseUrl: hostSettings.firebaseUrl,
+          customRoomName: hostSettings.customRoomName,
+        });
+        const url = new URL(window.location.origin + window.location.pathname);
+        url.searchParams.set('role', 'payer');
+        url.searchParams.set('pay', newRoomId || targetRoomKey);
+        payUrl = await shortenUrl(url.toString());
+      } else {
+        const fullCustomerUrl = buildShareUrl();
+        payUrl = await shortenUrl(fullCustomerUrl);
       }
-
-      const activeId = newRoomId || cloudRoomId;
-      const url = new URL(window.location.origin + window.location.pathname);
-      url.searchParams.set('pay', activeId);
-      payUrl = url.toString();
       setCloudSyncStatus('synced');
     } catch {
       payUrl = buildShareUrl();
@@ -1237,6 +1254,70 @@ export default function App() {
       showToast('Đã chép tin nhắn Zalo kèm Link Khách siêu ngắn!');
     } catch {
       showToast('Không thể sao chép tự động.');
+    }
+  };
+
+  // Xuất file sao lưu toàn bộ dữ liệu (JSON)
+  const handleExportBackup = () => {
+    const backupData = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      host: hostSettings,
+      items: participants,
+      teammates: savedTeammates,
+    };
+    const blob = new Blob([JSON.stringify(backupData, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `vietqr_backup_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('Đã tải xuống file sao lưu dữ liệu!');
+  };
+
+  // Khôi phục từ file sao lưu
+  const handleImportBackup = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const parsed = JSON.parse(event.target.result);
+        if (parsed?.items && Array.isArray(parsed.items)) {
+          setParticipants(parsed.items);
+          if (parsed.host) setHostSettings(parsed.host);
+          if (Array.isArray(parsed.teammates)) setSavedTeammates(parsed.teammates);
+          showToast(`Khôi phục thành công ${parsed.items.length} khoản!`);
+        } else {
+          showToast('File sao lưu không đúng định dạng!');
+        }
+      } catch {
+        showToast('Không thể đọc file sao lưu!');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  // Khôi phục bản snapshot tự động gần nhất
+  const handleRestoreLatestSnapshot = () => {
+    try {
+      const snap = localStorage.getItem(STORAGE_KEYS.BACKUP_SNAPSHOT);
+      if (!snap) {
+        showToast('Chưa có bản snapshot nào trong máy!');
+        return;
+      }
+      const parsed = JSON.parse(snap);
+      if (Array.isArray(parsed?.items) && parsed.items.length > 0) {
+        setParticipants(parsed.items);
+        if (parsed.host) setHostSettings((prev) => ({ ...prev, ...parsed.host }));
+        showToast(`Đã khôi phục ${parsed.items.length} khoản từ bản chụp gần nhất!`);
+      }
+    } catch {
+      showToast('Lỗi khôi phục snapshot!');
     }
   };
 
@@ -1659,8 +1740,9 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
     }
   };
 
-  // Đẩy cập nhật tức thì lên Cloud khi có thay đổi trạng thái thanh toán hoặc danh sách
+  // Đẩy cập nhật lên Firebase nếu người dùng có cấu hình Firebase
   const pushParticipantsToCloud = (nextItems) => {
+    if (!hostSettings.firebaseUrl || !hostSettings.firebaseUrl.trim()) return;
     const targetRoom =
       sharedUrlParams.roomId ||
       (appRole === 'host' ? hostSettings.customRoomName || cloudRoomId : '');
@@ -1676,7 +1758,7 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
       items: nextItems,
       firebaseUrl: hostSettings.firebaseUrl,
       customRoomName: hostSettings.customRoomName,
-    }).catch((err) => console.warn('Lỗi đồng bộ Cloud:', err));
+    }).catch((err) => console.warn('Lỗi đồng bộ Firebase:', err));
   };
 
   // Thao tác trạng thái theo từng khoản lẻ (item)
@@ -2115,6 +2197,18 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                 ))
               )}
             </section>
+
+            {/* Footer chuyển sang giao diện chủ trì */}
+            <footer className="text-center pt-8 pb-12 text-xs text-slate-400">
+              <span>Bạn là người tạo bill / chủ trì? </span>
+              <button
+                type="button"
+                onClick={() => setAppRole('host')}
+                className="font-bold text-emerald-700 hover:text-emerald-800 hover:underline"
+              >
+                Mở Giao diện Quản lý của tôi
+              </button>
+            </footer>
           </main>
         </>
       ) : (
@@ -2431,6 +2525,53 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                           placeholder="https://...-default-rtdb.firebaseio.com (để trống để dùng Cloud miễn phí sẵn có)"
                           className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-slate-800 outline-none focus:border-indigo-500 text-xs"
                         />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Quản lý Dữ liệu: Sao lưu & Khôi phục */}
+                  <div className="pt-3 border-t border-slate-200/80 space-y-2">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <HardDrive className="w-4 h-4 text-emerald-600" />
+                          <span>An toàn Dữ liệu (Sao lưu & Khôi phục)</span>
+                        </h3>
+                        <p className="text-[11px] text-slate-500">
+                          Mọi khoản tiền và cài đặt luôn tự động lưu vào máy. Bạn có thể tải file sao lưu để lưu giữ vĩnh viễn.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleExportBackup}
+                          className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition"
+                          title="Tải file sao lưu JSON về máy tính"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Xuất file sao lưu</span>
+                        </button>
+
+                        <label className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 transition cursor-pointer">
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>Nhập từ file</span>
+                          <input
+                            type="file"
+                            accept=".json"
+                            onChange={handleImportBackup}
+                            className="hidden"
+                          />
+                        </label>
+
+                        <button
+                          type="button"
+                          onClick={handleRestoreLatestSnapshot}
+                          className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 transition"
+                          title="Khôi phục lại dữ liệu từ bản chụp tự động gần nhất"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Khôi phục gần nhất</span>
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -3320,6 +3461,11 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                 )
               )}
             </section>
+
+            {/* Footer bản quyền */}
+            <footer className="text-center pt-8 pb-12 text-xs text-slate-400">
+              <span>Sổ Thu Tiền & Tạo VietQR • Dữ liệu tự động bảo vệ trên thiết bị</span>
+            </footer>
           </main>
         </>
       )}
