@@ -72,7 +72,7 @@ const QUICK_AMOUNTS = [
   { label: '60k', value: 60000 },
 ];
 
-const DEFAULT_TEAMMATES = ['anh Tài', 'anh Hà', 'anh Thành', 'Linh'];
+const DEFAULT_TEAMMATES = ['anh Tài', 'anh Hà', 'anh Thành', 'Linh', 'c Phương'];
 const LEGACY_DEFAULT_TEAMMATES = new Set(['nam', 'hùng', 'trang', 'minh', 'hương', 'tuấn', 'lan']);
 
 const DEFAULT_HOST_SETTINGS = {
@@ -84,14 +84,19 @@ const DEFAULT_HOST_SETTINGS = {
   customRoomName: '',
 };
 
-// Bản lưu trữ dữ liệu an toàn phục vụ khôi phục tức thì
+// Bản lưu trữ dữ liệu chính xác trích xuất từ lịch sử có c Phương (11 món)
 const SAVED_SESSION_BACKUP_ITEMS = [
-  { id: 'rec-1', name: 'anh Tài', note: 'kebab', amount: 75815, paid: false },
-  { id: 'rec-2', name: 'anh Hà', note: 'cơm bò', amount: 63308, paid: false },
-  { id: 'rec-3', name: 'Linh', note: 'nem chua', amount: 53000, paid: false },
-  { id: 'rec-4', name: 'anh Thành', note: 'nem chua', amount: 88000, paid: true },
-  { id: 'rec-5', name: 'anh Tài', note: 'nem chua', amount: 88000, paid: false },
-  { id: 'rec-6', name: 'anh Tài', note: 'shopee', amount: 239000, paid: false },
+  { id: '1793173295946-7ex2n9', name: 'anh Hà', note: 'bún mọc', amount: 47734, paid: false },
+  { id: '1793173290207-hhnru2', name: 'anh Tài', note: 'bún mọc', amount: 47734, paid: false },
+  { id: '1793173243161-te40d2', name: 'c Phương', note: 'bánh đa trộn', amount: 46000, paid: false },
+  { id: '1793173041926-o4bhoy', name: 'anh Hà', note: 'kebab', amount: 82000, paid: false },
+  { id: '1793173030890-66cplc', name: 'anh Tài', note: 'kebab', amount: 82000, paid: false },
+  { id: '1791968478148-s8mgu1', name: 'anh Tài', note: 'kebab', amount: 75815, paid: true },
+  { id: '1791968335913-trtyfc', name: 'anh Hà', note: 'cơm bò', amount: 63308, paid: false },
+  { id: '1791968287967-zl10wo', name: 'Linh', note: 'nem chua', amount: 53000, paid: true },
+  { id: '1791968277121-nweqzm', name: 'anh Thành', note: 'nem chua', amount: 88000, paid: true },
+  { id: '1791968264688-4lkqv9', name: 'anh Tài', note: 'nem chua', amount: 88000, paid: true },
+  { id: '1791967914052-sis1xd', name: 'anh Tài', note: 'shopee', amount: 239000, paid: true },
 ];
 
 const STORAGE_KEYS = {
@@ -2141,6 +2146,8 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                     className={`bg-white rounded-2xl shadow-sm border p-4 sm:p-5 transition ${
                       person.allPaid
                         ? 'border-emerald-200 bg-emerald-50/20'
+                        : person.partiallyPaid
+                        ? 'border-sky-200 bg-sky-50/15 hover:border-sky-300'
                         : 'border-slate-200/90 hover:border-emerald-300'
                     }`}
                   >
@@ -2154,35 +2161,59 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                             className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
                               person.allPaid
                                 ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                                : person.partiallyPaid
+                                ? 'bg-sky-100 text-sky-800 border-sky-200'
                                 : 'bg-amber-100 text-amber-800 border-amber-200'
                             }`}
                           >
-                            {person.allPaid ? '✓ Đã thanh toán' : 'Chưa thanh toán'}
+                            {person.allPaid
+                              ? '✓ Đã thanh toán đủ'
+                              : person.partiallyPaid
+                              ? `Đã trả 1 phần (${formatVND(person.paidAmount)})`
+                              : 'Chưa thanh toán'}
                           </span>
                         </div>
 
-                        {/* Chi tiết các món đã đặt */}
+                        {/* Chi tiết các món đã đặt (các món đã trả được gạch ngang rõ ràng) */}
                         <div className="flex flex-wrap gap-1.5">
                           {person.items.map((subItem, idx) => (
                             <span
                               key={subItem.id}
-                              className="inline-flex items-center gap-1 text-xs bg-slate-100 text-slate-700 px-2.5 py-1 rounded-lg border border-slate-200"
+                              className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition ${
+                                subItem.paid
+                                  ? 'bg-emerald-50/80 border-emerald-200 text-emerald-800 line-through opacity-70'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200'
+                              }`}
                             >
                               <span>{subItem.note || `Món #${idx + 1}`}:</span>
-                              <strong className="text-slate-900">
+                              <strong className={subItem.paid ? 'text-emerald-900 line-through' : 'text-slate-900'}>
                                 {formatVND(subItem.amount)}
                               </strong>
+                              {subItem.paid && (
+                                <span className="no-underline inline-block text-[10px] font-bold text-emerald-700 bg-emerald-100 px-1 py-0.5 rounded">
+                                  ✓ Đã trả
+                                </span>
+                              )}
                             </span>
                           ))}
                         </div>
 
-                        <div className="pt-1">
+                        <div className="pt-1 flex flex-wrap items-baseline gap-2">
                           <span className="text-xs text-slate-500">
-                            {person.allPaid ? 'Tổng đã thanh toán: ' : 'Tổng số tiền cần chuyển: '}
+                            {person.allPaid
+                              ? 'Tổng đã thanh toán: '
+                              : person.partiallyPaid
+                              ? 'Số tiền còn lại cần chuyển: '
+                              : 'Tổng số tiền cần chuyển: '}
                           </span>
                           <span className="text-xl font-black text-emerald-700">
                             {formatVND(person.qrAmount)}
                           </span>
+                          {person.partiallyPaid && (
+                            <span className="text-xs text-slate-500 font-medium">
+                              (Tổng các món: {formatVND(person.totalAmount)})
+                            </span>
+                          )}
                         </div>
                       </div>
 
@@ -2562,13 +2593,13 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                               accountNumber: '0925113116',
                               accountName: 'NGOTIENCONG',
                             }));
-                            showToast('Đã khôi phục 6 món ăn đã nhập trước đó!');
+                            showToast('Đã khôi phục 11 món ăn (có c Phương) thành công!');
                           }}
                           className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 transition"
-                          title="Khôi phục lại danh sách 6 khoản (anh Tài, anh Hà, Linh, anh Thành)"
+                          title="Khôi phục lại danh sách 11 món (anh Tài, anh Hà, c Phương, Linh, anh Thành)"
                         >
                           <RotateCcw className="w-3.5 h-3.5" />
-                          <span>Khôi phục 6 món đã nhập</span>
+                          <span>Khôi phục 11 món (có c Phương)</span>
                         </button>
 
                         <button
@@ -3218,13 +3249,13 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                 </div>
               </div>
 
-              {/* Nút Khôi phục nhanh 6 món đã nhập trước đó nếu người dùng cần */}
-              {participants.length < 6 && (
+              {/* Nút Khôi phục nhanh 11 món (có c Phương) đã nhập trước đó nếu người dùng cần */}
+              {participants.length < 11 && (
                 <div className="bg-amber-50 border-b border-amber-200/80 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-2 text-amber-900">
                     <RotateCcw className="w-4 h-4 text-amber-600 shrink-0" />
                     <span>
-                      Dữ liệu bị mất trước đó? Có sẵn bản lưu <strong>6 món</strong> (anh Tài, anh Hà, Linh, anh Thành).
+                      Dữ liệu bị mất trước đó? Có sẵn bản lưu <strong>11 món</strong> (anh Tài, anh Hà, c Phương, Linh, anh Thành).
                     </span>
                   </div>
                   <button
@@ -3237,11 +3268,11 @@ Trả về DUY NHẤT một JSON object theo cấu trúc:
                         accountNumber: '0925113116',
                         accountName: 'NGOTIENCONG',
                       }));
-                      showToast('Đã khôi phục thành công 6 món ăn đã nhập trước đó!');
+                      showToast('Đã khôi phục thành công 11 món ăn (có c Phương)!');
                     }}
                     className="font-bold text-amber-900 bg-amber-200/90 hover:bg-amber-300 px-3 py-1 rounded-lg transition active:scale-95 shadow-xs"
                   >
-                    Khôi phục 6 món ngay
+                    Khôi phục 11 món ngay
                   </button>
                 </div>
               )}
